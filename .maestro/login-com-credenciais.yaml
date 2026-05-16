@@ -1,0 +1,18 @@
+appId: com.isopro.campo
+---
+# Fluxo opcional com credenciais reais (CI local / dispositivo de teste).
+# MAESTRO_LOGIN e MAESTRO_PASSWORD devem existir no ambiente: `maestro test .maestro/login-com-credenciais.yaml`
+- launchApp
+- assertVisible:
+    id: "mobile-login-title"
+- tapOn:
+    id: "mobile-login-usuario"
+- inputText: ${MAESTRO_LOGIN}
+- tapOn:
+    id: "mobile-login-senha"
+- inputText: ${MAESTRO_PASSWORD}
+- tapOn:
+    id: "mobile-login-submit"
+- extendedWaitUntil:
+    visible: "Início"
+    timeout: 90000

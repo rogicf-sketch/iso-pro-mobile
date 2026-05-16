@@ -1,0 +1,9 @@
+appId: com.isopro.campo
+---
+# Smoke sem credenciais: o botão Entrar com campos vazios deve mostrar validação alinhada ao `loginMobile`.
+- launchApp
+- assertVisible:
+    id: "mobile-login-title"
+- tapOn:
+    id: "mobile-login-submit"
+- assertVisible: "Informe login e senha."

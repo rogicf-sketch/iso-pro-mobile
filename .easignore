@@ -1,0 +1,12 @@
+# Reinstalado no servidor EAS — reduz o tamanho do upload
+node_modules/
+
+# Artefactos locais
+.expo/
+dist/
+web-build/
+
+# Git e IDE
+.git/
+.gitignore
+*.log

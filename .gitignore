@@ -1,0 +1,16 @@
+node_modules/
+# Pastas nativas geradas por prebuild local — nao commitar; EAS gera na nuvem a partir do app.config.
+android/
+ios/
+.expo/
+dist/
+npm-debug.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
+web-build/
+.env
+.env.local
