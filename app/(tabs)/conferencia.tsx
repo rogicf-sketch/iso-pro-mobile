@@ -24,7 +24,10 @@ import {
   resolverBuscaRecebimentoPorNota,
   rotuloNotaRomaneioRecebimento,
 } from '@/src/lib/recebimentoBusca';
-import { linhaEstadoConferenciaMobile } from '@/src/lib/recebimentoConferenciaMobile';
+import {
+  linhaEstadoConferenciaMobile,
+  recebimentoPermiteEditarConferencia,
+} from '@/src/lib/recebimentoConferenciaMobile';
 import { commitDefaultSnapshotWrite, fetchDefaultSnapshot } from '@/src/lib/snapshot';
 import { hasSupabaseConfig } from '@/src/lib/config';
 import { formatarDataHoraLocal } from '@/src/lib/formatData';
@@ -60,14 +63,6 @@ const MAX_OBSERVACAO_ITEM = 2048;
 function mesmoRecebimentoConferencia(selecionado: Recebimento | null, linha: Recebimento): boolean {
   if (!selecionado) return false;
   return String(selecionado.id) === String(linha.id);
-}
-
-/** Só recebimentos «aguardando conferência» e ainda não conferidos permitem editar quantidades. */
-function recebimentoPermiteEditarConferencia(r: Recebimento | null): boolean {
-  if (!r) return false;
-  if (String(r.statusConferencia || 'pendente') === 'conferido') return false;
-  if ((r.modoRecebimento || 'direto') !== 'aguardando_conferencia') return false;
-  return true;
 }
 
 export default function ConferenciaScreen() {

@@ -1,8 +1,12 @@
+# CI: typecheck, Vitest, lint, audit (high+). iso-pro-shared via vendor/ ou pasta irmã no monorepo local.
+# Local: npm run ci — Release campo: docs/checklist-release-campo.md
+
 name: CI
 
 run-name: CI · ${{ github.event_name }} · ${{ github.ref_name }}
 
 on:
+  workflow_dispatch:
   push:
     branches: [main, master]
   pull_request:
@@ -26,6 +30,22 @@ jobs:
         with:
           node-version-file: '.nvmrc'
           cache: npm
+
+      - name: Link iso-pro-shared for npm (vendor ou monorepo)
+        shell: bash
+        run: |
+          set -euo pipefail
+          parent="$(dirname "$GITHUB_WORKSPACE")"
+          target="$parent/iso-pro-shared"
+          if [ -f "$target/package.json" ]; then
+            echo "Usando iso-pro-shared já presente em $target"
+          elif [ -f vendor/iso-pro-shared/package.json ]; then
+            ln -sfn "$GITHUB_WORKSPACE/vendor/iso-pro-shared" "$target"
+            echo "Symlink vendor → $target"
+          else
+            echo "::error::iso-pro-shared ausente. Corra scripts/sync-vendor-iso-pro-shared.ps1 e commit vendor/."
+            exit 1
+          fi
 
       - name: Install dependencies
         run: npm ci

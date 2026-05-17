@@ -51,6 +51,22 @@ describe('buildSaldoOperacionalParaAtendimento', () => {
     expect(map.get('M1') ?? 0).toBe(0);
   });
 
+  it('pendente com quantidades preenchidas (correcao) ainda nao entra no saldo', () => {
+    const payload: IsoSnapshotPayload = {
+      recebimentos: [
+        {
+          id: 'r1',
+          modoRecebimento: 'aguardando_conferencia',
+          statusConferencia: 'pendente',
+          itens: [{ codigo: 'M1', quantidade: 10, quantidadeConferida: 8 }],
+        },
+      ],
+      documentos: [],
+      materiais: [],
+    };
+    expect(buildSaldoOperacionalParaAtendimento(payload).get('M1') ?? 0).toBe(0);
+  });
+
   it('em modo não direto só conta quantidade conferida quando status é conferido', () => {
     const base = {
       id: 'r1',

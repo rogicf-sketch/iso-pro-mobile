@@ -47,7 +47,21 @@ Em desenvolvimento com `expo start`, após atualizar `iso-pro-shared`: `npm run 
 - `npm run lint` — ESLint (Expo), **falha se houver avisos** (`--max-warnings 0`)
 - `npm run ci` — typecheck + testes + lint + `npm audit` (nível high)
 
-Com GitHub Actions, o fluxo em `.github/workflows/ci.yml` corre `npm ci` e `npm run ci` em pushes/PRs para `main` ou `master`.
+Com GitHub Actions, o fluxo em [`.github/workflows/ci.yml`](.github/workflows/ci.yml) corre `npm ci` e `npm run ci` em pushes/PRs para `main` ou `master` (e manualmente em **Actions → CI → Run workflow**). O job usa `vendor/iso-pro-shared` (cópia do contrato Zod) ou a pasta irmã `../iso-pro-shared` no monorepo local.
+
+Depois de alterar `iso-pro-shared` na pasta mestre, atualize o vendor antes de commitar o mobile:
+
+```powershell
+.\scripts\sync-vendor-iso-pro-shared.ps1
+```
+
+## Release para obra (APK / EAS)
+
+Antes de distribuir build a campo (**versão atual: 1.0.20**, `android.versionCode` **21** em `app.config.ts`):
+
+1. `npm run ci` nesta pasta.
+2. Seguir o checklist manual: [`docs/checklist-release-campo.md`](docs/checklist-release-campo.md) (sync, conferência com destravar, atendimento, recibos — ~15–20 min com telemóvel + PC na mesma nuvem).
+3. Gerar APK/AAB (`build:android:preview` / EAS) e confirmar a versão no ecrã de login do app.
 
 ## E2E mobile (Maestro)
 

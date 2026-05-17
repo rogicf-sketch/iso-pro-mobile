@@ -1,0 +1,24 @@
+﻿{
+  "name": "iso-pro-shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Contrato TypeScript (vendored para CI/release mobile). Origem: ../iso-pro-shared — atualizar com scripts/sync-vendor-iso-pro-shared.ps1",
+  "license": "UNLICENSED",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./validators": {
+      "types": "./dist/validators.d.ts",
+      "default": "./dist/validators.js"
+    }
+  },
+  "files": ["dist"],
+  "dependencies": {
+    "zod": "^4.3.6"
+  }
+}

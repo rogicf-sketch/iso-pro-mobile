@@ -5,10 +5,28 @@ import type { Recebimento } from 'iso-pro-shared';
  * (evita «pendência» falsa em recebimento direto ou já conferido).
  */
 export function recebimentoEmConferenciaAberta(r: Recebimento | null): boolean {
+  return recebimentoPermiteEditarConferencia(r);
+}
+
+/** Recebimento ainda editável no ecrã de conferência (pendente + modo aguardando conferência). */
+export function recebimentoPermiteEditarConferencia(r: Recebimento | null): boolean {
   if (!r) return false;
   if (String(r.statusConferencia || 'pendente') === 'conferido') return false;
   if ((r.modoRecebimento || 'direto') !== 'aguardando_conferencia') return false;
   return true;
+}
+
+/** Linha com quantidade conferida explícita ou observação (ex.: após destravar no PC). */
+export function recebimentoTemConferenciaParcialGravada(r: Recebimento | null): boolean {
+  if (!r?.itens?.length) return false;
+  return r.itens.some((it) => {
+    const temObs = Boolean(String(it.observacaoItem ?? '').trim());
+    if (temObs) return true;
+    const qc = it.quantidadeConferida;
+    if (qc === undefined || qc === null) return false;
+    if (typeof qc === 'string' && qc.trim() === '') return false;
+    return true;
+  });
 }
 
 /**
@@ -22,6 +40,9 @@ export function linhaEstadoConferenciaMobile(r: Recebimento): string {
     return 'Conferência concluída';
   }
   if (modo === 'aguardando_conferencia') {
+    if (conf === 'pendente' && recebimentoTemConferenciaParcialGravada(r)) {
+      return 'Conferência em correção';
+    }
     return conf === 'pendente' ? 'Aguardando conferência' : `Conferência: ${conf}`;
   }
   if (modo === 'direto') {
