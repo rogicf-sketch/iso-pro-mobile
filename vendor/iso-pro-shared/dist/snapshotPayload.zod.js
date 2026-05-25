@@ -25,6 +25,7 @@ const recebimentoItemSchema = z
     quantidade: z.union([z.number(), s]).optional(),
     quantidadeConferida: z.union([z.number(), s, z.null()]).optional(),
     observacaoItem: sShort.optional(),
+    localizacao: sShort.optional(),
     unidade: sShort.optional(),
     disciplina: sShort.optional(),
 })
@@ -156,6 +157,7 @@ export const isoSnapshotPayloadSchema = z
     atendimentoHistorico: optionalArray(atendimentoHistoricoLinhaSchema),
     atendimentoLotes: optionalArray(atendimentoLoteSchema),
     inventarios: optionalArray(inventarioSnapshotSchema),
+    etiquetas: unknownArray,
     estoqueAjustes: unknownArray,
     configuracoesSistema: z.record(z.string(), z.unknown()).optional(),
     usuariosSistema: z.unknown().optional(),

@@ -38,6 +38,12 @@ import {
 } from '@/src/lib/conferenciaQuantidades';
 import { conferenciaLocalDifereDoSnapshot } from '@/src/lib/conferenciaEstado';
 import {
+  MAX_LOCALIZACAO_ITEM,
+  aplicarLocalizacaoNoItem,
+  locLinhaNormalizada,
+  normalizarTextoLocalizacaoItem,
+} from '@/src/lib/conferenciaLocalizacao';
+import {
   lerRascunhoConferencia,
   limparRascunhoConferencia,
   salvarRascunhoConferencia,
@@ -84,6 +90,8 @@ export default function ConferenciaScreen() {
 
   /** Texto do campo «Qtd conf.» por linha — evita mostrar 0 inicial (digitar 1 virava 10). */
   const [qtdConfTextoPorLinha, setQtdConfTextoPorLinha] = useState<Record<string, string>>({});
+  /** Texto do campo «Local» por linha (sincronizado com `localizacao` no item). */
+  const [localTextoPorLinha, setLocalTextoPorLinha] = useState<Record<string, string>>({});
 
   const [obsModalIndex, setObsModalIndex] = useState<number | null>(null);
   const [obsModalDraft, setObsModalDraft] = useState('');
@@ -245,27 +253,31 @@ export default function ConferenciaScreen() {
   useEffect(() => {
     if (!rec?.itens) {
       setQtdConfTextoPorLinha({});
+      setLocalTextoPorLinha({});
       return;
     }
     const rid = String(rec.id);
-    const next: Record<string, string> = {};
+    const nextQtd: Record<string, string> = {};
+    const nextLoc: Record<string, string> = {};
     rec.itens.forEach((it, i) => {
       const k = `${rid}-${i}`;
       const qc = it?.quantidadeConferida;
       if (qc === undefined || qc === null) {
-        next[k] = '';
+        nextQtd[k] = '';
       } else if (typeof qc === 'string' && qc.trim() === '') {
-        next[k] = '';
+        nextQtd[k] = '';
       } else {
         const n = typeof qc === 'number' ? qc : Number(String(qc).replace(',', '.'));
         if (Number.isFinite(n) && n === 0) {
-          next[k] = '';
+          nextQtd[k] = '';
         } else {
-          next[k] = String(qc);
+          nextQtd[k] = String(qc);
         }
       }
+      nextLoc[k] = locLinhaNormalizada(it as RecebimentoItem);
     });
-    setQtdConfTextoPorLinha(next);
+    setQtdConfTextoPorLinha(nextQtd);
+    setLocalTextoPorLinha(nextLoc);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- só ao trocar o recebimento; `rec.itens` omitido para não sobrescrever edição ao atualizar snapshot
   }, [rec?.id]);
 
@@ -280,6 +292,18 @@ export default function ConferenciaScreen() {
       } else {
         row.quantidadeConferida = q;
       }
+      itens[index] = row;
+      return { ...prev, itens };
+    });
+  }, []);
+
+  const atualizarLocalizacaoItem = useCallback((index: number, texto: string) => {
+    const fatiado = normalizarTextoLocalizacaoItem(texto);
+    setRec((prev) => {
+      if (!prev?.itens) return prev;
+      const itens = [...prev.itens];
+      const row = { ...(itens[index] as RecebimentoItem) };
+      aplicarLocalizacaoNoItem(row, fatiado);
       itens[index] = row;
       return { ...prev, itens };
     });
@@ -330,6 +354,12 @@ export default function ConferenciaScreen() {
           it.observacaoItem = String(obs).trim();
         } else {
           delete it.observacaoItem;
+        }
+        const loc = locLinhaNormalizada(d);
+        if (loc) {
+          it.localizacao = loc;
+        } else {
+          delete it.localizacao;
         }
       }
     });
@@ -503,6 +533,19 @@ export default function ConferenciaScreen() {
 
   const podeEditarConferenciaRec = useMemo(() => recebimentoPermiteEditarConferencia(rec), [rec]);
 
+  /** Local definido no PC / último guardado na nuvem (referência «Previsto» na conferência). */
+  const localPrevistoPorLinha = useMemo(() => {
+    if (!rec?.id || !payload?.recebimentos?.length) return {};
+    const server = payload.recebimentos.find((r) => String(r.id) === String(rec.id));
+    const prev: Record<string, string> = {};
+    const rid = String(rec.id);
+    (server?.itens || []).forEach((it, i) => {
+      const loc = locLinhaNormalizada(it as RecebimentoItem);
+      if (loc) prev[`${rid}-${i}`] = loc;
+    });
+    return prev;
+  }, [rec?.id, payload]);
+
   /** Rascunho local no telemóvel (continuar depois) — não substitui «Guardar na nuvem». */
   useDebouncedEffect(
     () => {
@@ -515,7 +558,7 @@ export default function ConferenciaScreen() {
         updatedAt: new Date().toISOString(),
       });
     },
-    [rec, nfBusca, qtdConfTextoPorLinha],
+    [rec, nfBusca, qtdConfTextoPorLinha, localTextoPorLinha],
     750,
   );
 
@@ -738,7 +781,7 @@ export default function ConferenciaScreen() {
               {podeEditarConferenciaRec ? (
                 <>
                   Código a vermelho = quantidade conferida abaixo da NF (parcial ou zero). Campo vazio em «Qtd conf.» será tratado como igual à NF ao
-                  finalizar. Toque em «⋯» para observação só deste item (divergência, embalagem, etc.).
+                  finalizar. Confirme ou corrija o local abaixo da quantidade (veio do PC ou «Previsto»). Toque em «⋯» para observação por item.
                 </>
               ) : (
                 <>
@@ -752,6 +795,9 @@ export default function ConferenciaScreen() {
             const divLinha = podeEditarConferenciaRec && linhaComDivergenciaVisual(it as RecebimentoItem);
             const linhaKey = `${String(rec.id)}-${i}`;
             const obsLinha = String((it as RecebimentoItem).observacaoItem ?? '').trim();
+            const localPrevisto = localPrevistoPorLinha[linhaKey] ?? '';
+            const localAtual = localTextoPorLinha[linhaKey] ?? '';
+            const localAlterado = Boolean(localPrevisto && normalizarTextoLocalizacaoItem(localAtual) !== localPrevisto);
             return (
             <View key={i} style={[styles.itemRow, divLinha && styles.itemRowDivergencia]}>
               <View style={{ flex: 1 }}>
@@ -783,19 +829,58 @@ export default function ConferenciaScreen() {
                   </Text>
                 ) : null}
               </View>
-              <TextInput
-                style={[styles.inputQtd, !podeEditarConferenciaRec && { opacity: 0.65 }]}
-                placeholder="Qtd conf."
-                placeholderTextColor={colors.placeholder}
-                keyboardType="decimal-pad"
-                editable={podeEditarConferenciaRec}
-                value={qtdConfTextoPorLinha[linhaKey] ?? ''}
-                onChangeText={(t) => {
-                  if (!podeEditarConferenciaRec) return;
-                  setQtdConfTextoPorLinha((prev) => ({ ...prev, [linhaKey]: t }));
-                  atualizarItem(i, t);
-                }}
-              />
+              <View style={styles.itemColDireita}>
+                <Text style={styles.labelCampoLinha}>Qtd conf.</Text>
+                <TextInput
+                  style={[styles.inputQtd, !podeEditarConferenciaRec && { opacity: 0.65 }]}
+                  placeholder="—"
+                  placeholderTextColor={colors.placeholder}
+                  keyboardType="decimal-pad"
+                  editable={podeEditarConferenciaRec}
+                  value={qtdConfTextoPorLinha[linhaKey] ?? ''}
+                  onChangeText={(t) => {
+                    if (!podeEditarConferenciaRec) return;
+                    setQtdConfTextoPorLinha((prev) => ({ ...prev, [linhaKey]: t }));
+                    atualizarItem(i, t);
+                  }}
+                />
+                <Text style={styles.labelCampoLinha}>Local</Text>
+                {localPrevisto ? (
+                  <Text style={styles.localPrevisto} numberOfLines={1}>
+                    Prev.: {localPrevisto}
+                  </Text>
+                ) : null}
+                <TextInput
+                  style={[
+                    styles.inputLocal,
+                    localAlterado && styles.inputLocalAlterada,
+                    !podeEditarConferenciaRec && { opacity: 0.65 },
+                  ]}
+                  placeholder={localPrevisto ? 'Confirmar local' : 'Ex.: A-12'}
+                  placeholderTextColor={colors.placeholder}
+                  editable={podeEditarConferenciaRec}
+                  maxLength={MAX_LOCALIZACAO_ITEM}
+                  value={localAtual}
+                  onChangeText={(t) => {
+                    if (!podeEditarConferenciaRec) return;
+                    const next = normalizarTextoLocalizacaoItem(t);
+                    setLocalTextoPorLinha((prev) => ({ ...prev, [linhaKey]: next }));
+                    atualizarLocalizacaoItem(i, next);
+                  }}
+                />
+                {podeEditarConferenciaRec && localPrevisto && localAtual.trim() !== localPrevisto ? (
+                  <Pressable
+                    accessibilityLabel="Usar local previsto do recebimento"
+                    style={styles.btnUsarLocalPrev}
+                    onPress={() => {
+                      setLocalTextoPorLinha((prev) => ({ ...prev, [linhaKey]: localPrevisto }));
+                      atualizarLocalizacaoItem(i, localPrevisto);
+                    }}
+                  >
+                    <Text style={styles.btnUsarLocalPrevText}>Usar previsto</Text>
+                  </Pressable>
+                ) : null}
+              </View>
             </View>
             );
           })}

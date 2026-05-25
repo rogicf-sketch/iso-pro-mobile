@@ -828,6 +828,11 @@ export default function ConsultaScreen() {
                     ? ` · Qtd conf.: ${String(it.quantidadeConferida)}`
                     : ''}
                 </Text>
+                {String((it as RecebimentoItem).localizacao ?? '').trim() ? (
+                  <Text style={[styles.meta2, { marginTop: 4 }]} numberOfLines={2}>
+                    Local: {String((it as RecebimentoItem).localizacao).trim()}
+                  </Text>
+                ) : null}
                 {String((it as RecebimentoItem).observacaoItem ?? '').trim() ? (
                   <Text style={[styles.meta2, { marginTop: 6, fontStyle: 'italic' }]} numberOfLines={4}>
                     Obs.: {String((it as RecebimentoItem).observacaoItem).trim()}

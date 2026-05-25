@@ -32,6 +32,7 @@ export declare const isoSnapshotPayloadSchema: z.ZodObject<{
             quantidade: z.ZodOptional<z.ZodUnion<readonly [z.ZodNumber, z.ZodString]>>;
             quantidadeConferida: z.ZodOptional<z.ZodUnion<readonly [z.ZodNumber, z.ZodString, z.ZodNull]>>;
             observacaoItem: z.ZodOptional<z.ZodString>;
+            localizacao: z.ZodOptional<z.ZodString>;
             unidade: z.ZodOptional<z.ZodString>;
             disciplina: z.ZodOptional<z.ZodString>;
         }, z.core.$loose>>>>;
@@ -118,6 +119,7 @@ export declare const isoSnapshotPayloadSchema: z.ZodObject<{
             quantidadeContada: z.ZodOptional<z.ZodNumber>;
         }, z.core.$loose>>>>;
     }, z.core.$loose>>>>;
+    etiquetas: z.ZodPipe<z.ZodTransform<any[] | undefined, unknown>, z.ZodOptional<z.ZodArray<z.ZodUnknown>>>;
     estoqueAjustes: z.ZodPipe<z.ZodTransform<any[] | undefined, unknown>, z.ZodOptional<z.ZodArray<z.ZodUnknown>>>;
     configuracoesSistema: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodUnknown>>;
     usuariosSistema: z.ZodOptional<z.ZodUnknown>;

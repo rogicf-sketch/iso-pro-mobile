@@ -32,6 +32,20 @@ describe('conferenciaLocalDifereDoSnapshot', () => {
     expect(conferenciaLocalDifereDoSnapshot(local, payloadComRec(server))).toBe(true);
   });
 
+  it('true quando localizacao local difere em pendente', () => {
+    const server = {
+      id: '1',
+      modoRecebimento: 'aguardando_conferencia',
+      statusConferencia: 'pendente',
+      itens: [{ codigo: 'A', quantidade: 5, localizacao: 'A-01' }],
+    } as Recebimento;
+    const local = {
+      ...server,
+      itens: [{ codigo: 'A', quantidade: 5, localizacao: 'B-02' }],
+    };
+    expect(conferenciaLocalDifereDoSnapshot(local, payloadComRec(server))).toBe(true);
+  });
+
   it('false apos destravar PC quando local alinhado ao snapshot (pendente com mesmas qty)', () => {
     const server = {
       id: '1',

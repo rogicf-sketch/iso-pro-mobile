@@ -15,6 +15,13 @@ function obsLinhaNormalizada(it: RecebimentoItem | undefined): string {
   return String(o).trim();
 }
 
+function locLinhaNormalizada(it: RecebimentoItem | undefined): string {
+  if (!it) return '';
+  const l = it.localizacao;
+  if (l === undefined || l === null) return '';
+  return String(l).trim();
+}
+
 function itensConferenciaQuantidadesDiferem(
   a: RecebimentoItem[] | undefined | null,
   b: RecebimentoItem[] | undefined | null,
@@ -23,6 +30,7 @@ function itensConferenciaQuantidadesDiferem(
   for (let i = 0; i < len; i++) {
     if (qcLinhaNormalizada(a?.[i] ?? undefined) !== qcLinhaNormalizada(b?.[i] ?? undefined)) return true;
     if (obsLinhaNormalizada(a?.[i] ?? undefined) !== obsLinhaNormalizada(b?.[i] ?? undefined)) return true;
+    if (locLinhaNormalizada(a?.[i] ?? undefined) !== locLinhaNormalizada(b?.[i] ?? undefined)) return true;
   }
   return false;
 }
