@@ -41,6 +41,9 @@ import {
   MAX_LOCALIZACAO_ITEM,
   aplicarLocalizacaoNoItem,
   locLinhaNormalizada,
+  aplicarLocalizacaoEmEdicaoNoItem,
+  limitarTextoLocalizacaoEmEdicao,
+  normalizarLocalizacaoItensRecebimento,
   normalizarTextoLocalizacaoItem,
 } from '@/src/lib/conferenciaLocalizacao';
 import {
@@ -298,12 +301,12 @@ export default function ConferenciaScreen() {
   }, []);
 
   const atualizarLocalizacaoItem = useCallback((index: number, texto: string) => {
-    const fatiado = normalizarTextoLocalizacaoItem(texto);
+    const fatiado = limitarTextoLocalizacaoEmEdicao(texto);
     setRec((prev) => {
       if (!prev?.itens) return prev;
       const itens = [...prev.itens];
       const row = { ...(itens[index] as RecebimentoItem) };
-      aplicarLocalizacaoNoItem(row, fatiado);
+      aplicarLocalizacaoEmEdicaoNoItem(row, fatiado);
       itens[index] = row;
       return { ...prev, itens };
     });
@@ -399,7 +402,9 @@ export default function ConferenciaScreen() {
           if (idx === -1) {
             throw new Error('Não foi possível atualizar o recebimento no pacote.');
           }
-          next.recebimentos![idx] = deepClone(rec);
+          const recGravar = deepClone(rec);
+          normalizarLocalizacaoItensRecebimento(recGravar.itens);
+          next.recebimentos![idx] = recGravar;
           next.dataAtualizacao = new Date().toISOString();
           return { nextPayload: next, baselineUpdatedAt: updatedAt };
         });
@@ -410,6 +415,12 @@ export default function ConferenciaScreen() {
           }
           return false;
         }
+        setRec((prev) => {
+          if (!prev) return prev;
+          const synced = deepClone(prev);
+          normalizarLocalizacaoItensRecebimento(synced.itens);
+          return synced;
+        });
         const nextPayload = mergeRecNoPayload(rec);
         if (nextPayload) {
           setPayload(nextPayload);
@@ -443,6 +454,7 @@ export default function ConferenciaScreen() {
 
     const executarGravacaoFinal = async () => {
       const r = deepClone(rec);
+      normalizarLocalizacaoItensRecebimento(r.itens);
       r.statusConferencia = 'conferido';
       /** Mantém o modo de negócio «aguardando conferência»; o estado final fica em `statusConferencia`. */
       r.modoRecebimento = 'aguardando_conferencia';
@@ -863,7 +875,7 @@ export default function ConferenciaScreen() {
                   value={localAtual}
                   onChangeText={(t) => {
                     if (!podeEditarConferenciaRec) return;
-                    const next = normalizarTextoLocalizacaoItem(t);
+                    const next = limitarTextoLocalizacaoEmEdicao(t);
                     setLocalTextoPorLinha((prev) => ({ ...prev, [linhaKey]: next }));
                     atualizarLocalizacaoItem(i, next);
                   }}
