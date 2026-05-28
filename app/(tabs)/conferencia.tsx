@@ -39,7 +39,6 @@ import {
 import { conferenciaLocalDifereDoSnapshot } from '@/src/lib/conferenciaEstado';
 import {
   MAX_LOCALIZACAO_ITEM,
-  aplicarLocalizacaoNoItem,
   locLinhaNormalizada,
   aplicarLocalizacaoEmEdicaoNoItem,
   limitarTextoLocalizacaoEmEdicao,
