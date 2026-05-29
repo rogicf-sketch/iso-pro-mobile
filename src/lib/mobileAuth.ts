@@ -1,6 +1,7 @@
 import { hasSupabaseConfig } from './config';
 import { getSupabase } from './supabase';
 import { platformDeleteItem, platformGetItem, platformSetItem } from './platformStorage';
+import { hashPassword, isPasswordHash, verifyPassword } from 'iso-pro-shared';
 
 /** v2: builds antigos usavam v1 — assim forçamos novo login após atualizar o APK (resolve «entra direto» com sessão velha). */
 const SESSION_KEY = 'iso_pro_mobile_session_v2';
@@ -183,8 +184,24 @@ export async function loginMobile(login: string, senha: string): Promise<MobileS
   }
 
   const rowRaw = data as RemoteUserRow | null;
-  if (!rowRaw || String(rowRaw.senha ?? '') !== senhaTrimmed) {
+  const storedSenha = String(rowRaw?.senha ?? '');
+  if (!rowRaw || !(await verifyPassword(senhaTrimmed, storedSenha))) {
     throw new Error('Login ou senha invalidos.');
+  }
+
+  if (!isPasswordHash(storedSenha)) {
+    void (async () => {
+      try {
+        const hashed = await hashPassword(senhaTrimmed);
+        await supabase
+          .from('usuarios_sistema')
+          .update({ senha: hashed })
+          .eq('id', rowRaw.id)
+          .eq('login', loginKey);
+      } catch {
+        /* migração best-effort */
+      }
+    })();
   }
 
   const row = normalizeRemoteRow(rowRaw);
