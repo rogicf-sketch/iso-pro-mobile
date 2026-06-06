@@ -1,4 +1,5 @@
 import { getSupabase } from './supabase';
+import { getActiveTenantId } from './isoProTenant';
 import { getStoredDeviceRecord, registerDevice, saveDeviceRecord, type MobileDeviceRecord } from './mobileDevice';
 import type { MobileSession } from './mobileAuth';
 
@@ -9,6 +10,8 @@ export type MobileAccessResult = {
   device: MobileDeviceRecord;
   source: 'local' | 'supabase';
   warning: string | null;
+  /** Supabase indisponível: controlo de aparelho não foi revalidado. */
+  offlineUnverified: boolean;
 };
 
 type RemoteDeviceRow = {
@@ -59,13 +62,16 @@ export async function resolveMobileAccess(session: MobileSession): Promise<Mobil
       state: normalizeState(localDevice),
       device: localDevice,
       source: 'local',
-      warning: null,
+      warning: 'Supabase nao configurado — controlo de aparelho apenas local.',
+      offlineUnverified: true,
     };
   }
 
   try {
+    const tenantId = session.tenantId || getActiveTenantId();
     const remotePayload = {
       device_id: localDevice.deviceId,
+      tenant_id: tenantId,
       nome_aparelho: localDevice.nomeAparelho,
       plataforma: localDevice.plataforma,
       modelo: localDevice.modelo,
@@ -79,14 +85,19 @@ export async function resolveMobileAccess(session: MobileSession): Promise<Mobil
       .from('dispositivos_mobile')
       .select('id,device_id,nome_aparelho,plataforma,modelo,versao_app,autorizado,bloqueado,usuario_login,usuario_nome,ultimo_acesso_em')
       .eq('device_id', localDevice.deviceId)
+      .eq('tenant_id', tenantId)
       .maybeSingle();
 
     if (fetchError) {
+      const offlineDevice = applyOfflineDevicePolicy(localDevice);
+      await saveDeviceRecord(offlineDevice);
       return {
-        state: normalizeState(localDevice),
-        device: localDevice,
+        state: normalizeState(offlineDevice),
+        device: offlineDevice,
         source: 'local',
-        warning: fetchError.message,
+        warning:
+          'Modo offline: controlo de aparelho nao verificado na nuvem. Ligacao restabelecida atualiza autorizacao.',
+        offlineUnverified: true,
       };
     }
 
@@ -113,11 +124,15 @@ export async function resolveMobileAccess(session: MobileSession): Promise<Mobil
       .single();
 
     if (saveError) {
+      const offlineDevice = applyOfflineDevicePolicy(localDevice);
+      await saveDeviceRecord(offlineDevice);
       return {
-        state: normalizeState(localDevice),
-        device: localDevice,
+        state: normalizeState(offlineDevice),
+        device: offlineDevice,
         source: 'local',
-        warning: saveError.message,
+        warning:
+          'Modo offline: controlo de aparelho nao verificado na nuvem. Ligacao restabelecida atualiza autorizacao.',
+        offlineUnverified: true,
       };
     }
 
@@ -131,20 +146,41 @@ export async function resolveMobileAccess(session: MobileSession): Promise<Mobil
     });
 
     const merged = mapRemoteRow(savedRow ?? {}, localDevice);
-    await saveDeviceRecord(merged);
+    const withRemoteStamp: MobileDeviceRecord = {
+      ...merged,
+      ultimaValidacaoRemotaEm: new Date().toISOString(),
+      remotoAutorizado: merged.autorizado,
+      remotoBloqueado: merged.bloqueado,
+    };
+    await saveDeviceRecord(withRemoteStamp);
     return {
-      state: normalizeState(merged),
-      device: merged,
+      state: normalizeState(withRemoteStamp),
+      device: withRemoteStamp,
       source: 'supabase',
       warning: null,
+      offlineUnverified: false,
     };
-  } catch (error) {
-    await saveDeviceRecord(localDevice);
+  } catch {
+    const offlineDevice = applyOfflineDevicePolicy(localDevice);
+    await saveDeviceRecord(offlineDevice);
     return {
-      state: normalizeState(localDevice),
-      device: localDevice,
+      state: normalizeState(offlineDevice),
+      device: offlineDevice,
       source: 'local',
-      warning: error instanceof Error ? error.message : 'Falha ao validar acesso no Supabase.',
+      warning:
+        'Modo offline: controlo de aparelho nao verificado na nuvem. Ligacao restabelecida atualiza autorizacao.',
+      offlineUnverified: true,
     };
   }
+}
+
+/** Em offline, respeita bloqueio/revogação conhecida da última validação remota. */
+function applyOfflineDevicePolicy(device: MobileDeviceRecord): MobileDeviceRecord {
+  if (device.remotoBloqueado === true) {
+    return { ...device, bloqueado: true, autorizado: false };
+  }
+  if (device.remotoAutorizado === false) {
+    return { ...device, autorizado: false };
+  }
+  return device;
 }

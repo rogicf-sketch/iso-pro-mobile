@@ -20,6 +20,7 @@ import { BrandLogoPanel } from '@/src/components/BrandLogoPanel';
 import { neonPrimaryButtonExtras } from '@/src/theme/neonButtonExtras';
 import { hasSupabaseConfig } from '@/src/lib/config';
 import { fetchSnapshotDiagnostics, type SnapshotDiagnostics } from '@/src/lib/snapshot';
+import { getOfflineSnapshotQueueSize } from '@/src/lib/offlineSnapshotQueue';
 import { resolveMobileAccess, type MobileAccessResult } from '@/src/lib/mobileAccess';
 import { getStoredMobileSession, logoutMobile, type MobileSession } from '@/src/lib/mobileAuth';
 import { getStoredDeviceRecord, type MobileDeviceRecord } from '@/src/lib/mobileDevice';
@@ -57,6 +58,7 @@ export default function HomeScreen() {
   const [appearanceOpen, setAppearanceOpen] = useState(false);
   const [bootReady, setBootReady] = useState(false);
   const [pullRefreshing, setPullRefreshing] = useState(false);
+  const [offlineQueueSize, setOfflineQueueSize] = useState(0);
 
   const refreshSessionAndDevice = useCallback(async (): Promise<MobileAccessResult | null> => {
     const nextSession = await getStoredMobileSession();
@@ -75,14 +77,20 @@ export default function HomeScreen() {
     return null;
   }, [router]);
 
+  const refreshOfflineQueueSize = useCallback(async () => {
+    setOfflineQueueSize(await getOfflineSnapshotQueueSize());
+  }, []);
+
   useEffect(() => {
     void refreshSessionAndDevice().finally(() => setBootReady(true));
-  }, [refreshSessionAndDevice]);
+    void refreshOfflineQueueSize();
+  }, [refreshSessionAndDevice, refreshOfflineQueueSize]);
 
   const onPullRefresh = useCallback(async () => {
     setPullRefreshing(true);
     try {
       await refreshSessionAndDevice();
+      await refreshOfflineQueueSize();
       if (hasSupabaseConfig()) {
         const nextDiag = await fetchSnapshotDiagnostics();
         setDiag(nextDiag);
@@ -90,7 +98,7 @@ export default function HomeScreen() {
     } finally {
       setPullRefreshing(false);
     }
-  }, [refreshSessionAndDevice]);
+  }, [refreshSessionAndDevice, refreshOfflineQueueSize]);
 
   const styles = useMemo(
     () =>
@@ -469,6 +477,16 @@ export default function HomeScreen() {
             <Text style={styles.sessionLabel}>Origem da validação</Text>
             <Text style={styles.sessionValue}>{accessInfo?.source ?? 'local'}</Text>
           </View>
+          {offlineQueueSize > 0 ? (
+            <Text style={[styles.sessionWarn, { marginTop: 10 }]}>
+              Fila offline: {offlineQueueSize} alteracao(oes) aguardam sincronizacao com a nuvem.
+            </Text>
+          ) : null}
+          {accessInfo?.offlineUnverified ? (
+            <Text style={[styles.sessionWarn, { marginTop: 10 }]}>
+              Modo offline: controlo de aparelho nao verificado no servidor.
+            </Text>
+          ) : null}
           {accessInfo?.warning ? (
             <Text style={[styles.sessionWarn, { marginTop: 10 }]}>Aviso: {accessInfo.warning}</Text>
           ) : null}
