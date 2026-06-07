@@ -3,8 +3,9 @@ node_modules/
 android/
 ios/
 .expo/
-dist/
-dist-eas-test*/
+/dist/
+/dist-eas-test*/
+*.tgz
 # Contrato Zod vendored para CI/EAS (npm file:./vendor/iso-pro-shared)
 !vendor/iso-pro-shared/dist/
 npm-debug.*

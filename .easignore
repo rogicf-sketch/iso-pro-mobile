@@ -7,12 +7,14 @@ dist/
 dist-eas-test/
 web-build/
 
-# Android nativo — caches/builds locais (EAS recompila)
+# Android nativo — caches locais; pasta android/ omitida para EAS usar prebuild (CNG)
 android/.gradle/
 android/build/
 android/app/build/
 android/.kotlin/
 android/local.properties
+android/
+ios/
 
 # Git e IDE
 .git/

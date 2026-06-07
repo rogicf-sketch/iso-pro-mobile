@@ -22,7 +22,8 @@
     "eas:init": "npx eas-cli init",
     "build:android:preview": "npx eas-cli build -p android --profile preview",
     "build:android:production": "npx eas-cli build -p android --profile production",
-    "build:android:local-apk": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/build-android-off-path.ps1"
+    "build:android:local-apk": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/build-android-off-path.ps1",
+    "postinstall": "node scripts/ensure-iso-pro-shared.mjs"
   },
   "engines": {
     "node": ">=22"
