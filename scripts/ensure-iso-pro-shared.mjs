@@ -17,7 +17,10 @@ if (fs.existsSync(marker)) {
 const vendorMarker = path.join(vendor, 'dist', 'index.js');
 if (!fs.existsSync(vendorMarker)) {
   console.error(
-    '[ensure-iso-pro-shared] Falta vendor/iso-pro-shared/dist. Corra scripts/sync-vendor-iso-pro-shared.ps1',
+    '[ensure-iso-pro-shared] Falta vendor/iso-pro-shared/dist/index.js no upload.',
+  );
+  console.error(
+    'Verifique .easignore (use /dist/ na raiz, não dist/) e scripts/sync-vendor-iso-pro-shared.ps1',
   );
   process.exit(1);
 }

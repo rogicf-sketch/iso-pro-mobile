@@ -1,10 +1,10 @@
 # Reinstalado no servidor EAS — reduz o tamanho do upload
 node_modules/
 
-# Artefactos locais
+# Artefactos locais (só raiz — não excluir vendor/iso-pro-shared/dist)
 .expo/
-dist/
-dist-eas-test/
+/dist/
+/dist-eas-test*/
 web-build/
 
 # Android nativo — caches locais; pasta android/ omitida para EAS usar prebuild (CNG)
