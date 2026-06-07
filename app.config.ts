@@ -10,7 +10,7 @@ const config: ExpoConfig = {
   /** Organizacao Expo (EAS); obrigatorio para builds na nuvem com conta de equipa. */
   owner: 'isopros-organization',
   /** Subir quando gerar APK/AAB novo (confirma no telemóvel que não é build antigo). */
-  version: '1.0.20',
+  version: '1.0.22',
   orientation: 'portrait',
   scheme: 'isopromobile',
   userInterfaceStyle: 'automatic',
@@ -30,7 +30,7 @@ const config: ExpoConfig = {
     package: 'com.isopro.campo',
     /** Evita que o Android restaure dados (ex.: sessão no SecureStore) após reinstalar — exigia login e parecia «entrar direto». */
     allowBackup: false,
-    versionCode: 21,
+    versionCode: 23,
     adaptiveIcon: {
       foregroundImage: './assets/app-icon.png',
       backgroundColor: brandBackground,
@@ -68,6 +68,8 @@ const config: ExpoConfig = {
   extra: {
     supabaseUrl: process.env.EXPO_PUBLIC_SUPABASE_URL ?? '',
     supabaseAnonKey: process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ?? '',
+    /** Empresa na nuvem (UUID). Sobrescreve o tenant por omissão quando definido no EAS/.env. */
+    isoProTenantId: process.env.EXPO_PUBLIC_ISO_PRO_TENANT_ID ?? '',
     eas: {
       projectId: '921d3c04-b6df-434f-8234-4a9a90658d00',
     },

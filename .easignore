@@ -4,7 +4,15 @@ node_modules/
 # Artefactos locais
 .expo/
 dist/
+dist-eas-test/
 web-build/
+
+# Android nativo — caches/builds locais (EAS recompila)
+android/.gradle/
+android/build/
+android/app/build/
+android/.kotlin/
+android/local.properties
 
 # Git e IDE
 .git/

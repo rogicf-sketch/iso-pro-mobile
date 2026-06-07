@@ -1,7 +1,7 @@
 import { hasSupabaseConfig } from './config';
-import { getSupabase } from './supabase';
+import { autenticarUsuarioIsoProRpc } from './isoProAuthRpc';
+import { getActiveTenantId, hydrateActiveTenantId, setActiveTenantId } from './isoProTenant';
 import { platformDeleteItem, platformGetItem, platformSetItem } from './platformStorage';
-import { hashPassword, isPasswordHash, verifyPassword } from 'iso-pro-shared';
 
 /** v2: builds antigos usavam v1 — assim forçamos novo login após atualizar o APK (resolve «entra direto» com sessão velha). */
 const SESSION_KEY = 'iso_pro_mobile_session_v2';
@@ -34,6 +34,7 @@ export type MobileSession = {
   login: string;
   nome: string;
   perfil: string;
+  tenantId: string;
 };
 
 function isValidMobileSession(s: unknown): s is MobileSession {
@@ -41,62 +42,25 @@ function isValidMobileSession(s: unknown): s is MobileSession {
   const o = s as MobileSession;
   const userId = String(o.userId ?? '').trim();
   const login = String(o.login ?? '').trim();
-  return userId.length > 0 && login.length > 0;
+  const tenantId = String(o.tenantId ?? '').trim();
+  return userId.length > 0 && login.length > 0 && tenantId.length > 0;
 }
 
-type RemotePermissionRow = {
-  modulo?: string | null;
-  acao?: string | null;
-  permitido?: boolean | null;
-};
-
-type RemoteProfileRow = {
-  id?: string | null;
-  nome?: string | null;
-  codigo?: string | null;
-  perfil_permissoes?: RemotePermissionRow[] | null;
-};
-
-type RemoteUserRow = {
-  id?: string | null;
-  login?: string | null;
-  nome?: string | null;
-  senha?: string | null;
-  ativo?: boolean | null;
-  perfis_acesso?: RemoteProfileRow | RemoteProfileRow[] | null;
-  usuario_permissoes?: RemotePermissionRow[] | null;
-};
-
-type NormalizedRemoteUserRow = Omit<RemoteUserRow, 'perfis_acesso'> & {
-  perfis_acesso?: RemoteProfileRow | null;
-};
-
-function normalizeRemoteRow(data: RemoteUserRow): NormalizedRemoteUserRow {
-  const p = data.perfis_acesso;
-  const perfis_acesso =
-    p == null ? null : Array.isArray(p) ? p[0] ?? null : p;
-  return { ...data, perfis_acesso };
-}
-
-function effectivePermissions(row: NormalizedRemoteUserRow): RemotePermissionRow[] {
-  const perfil = row.perfis_acesso;
-  const fromUser = row.usuario_permissoes;
-  if (fromUser?.length) return fromUser;
-  return perfil?.perfil_permissoes ?? [];
-}
-
-function hasMobileModuleAccess(row: NormalizedRemoteUserRow): boolean {
-  return effectivePermissions(row).some((p) => p.modulo === 'mobile' && p.permitido === true);
-}
-
-function sessionFromRemoteUser(row: NormalizedRemoteUserRow): MobileSession {
-  const perfil = row.perfis_acesso;
-  const perfilLabel = String(perfil?.codigo ?? perfil?.id ?? perfil?.nome ?? '').trim() || 'perfil';
+function sessionFromRpcUser(
+  user: {
+    id: string;
+    login: string;
+    nome: string;
+    perfil: { nome: string; id: string };
+  },
+  tenantId: string,
+): MobileSession {
   return {
-    userId: String(row.id ?? ''),
-    login: String(row.login ?? ''),
-    nome: String(row.nome ?? row.login ?? 'Utilizador'),
-    perfil: perfilLabel,
+    userId: user.id,
+    login: user.login,
+    nome: user.nome,
+    perfil: user.perfil.nome || user.perfil.id || 'perfil',
+    tenantId,
   };
 }
 
@@ -113,6 +77,7 @@ export async function getStoredMobileSession(): Promise<MobileSession | null> {
       sessionCache = null;
       return null;
     }
+    await setActiveTenantId(parsed.tenantId);
     sessionCache = parsed;
     return sessionCache;
   } catch {
@@ -123,10 +88,10 @@ export async function getStoredMobileSession(): Promise<MobileSession | null> {
 }
 
 /**
- * Login alinhado ao I.S.O PRO desktop: valida `usuarios_sistema` no Supabase (mesma query e comparacao de senha).
- * Exige perfil com permissao ao modulo `mobile`.
+ * Login via RPC `iso_pro_autenticar_usuario` (senha não trafega em SELECT).
+ * Requer migração de segurança aplicada no Supabase (`db push`).
  */
-export async function loginMobile(login: string, senha: string): Promise<MobileSession> {
+export async function loginMobile(login: string, senha: string, tenantId?: string): Promise<MobileSession> {
   const loginTrimmed = login.trim();
   const senhaTrimmed = senha.trim();
 
@@ -140,26 +105,35 @@ export async function loginMobile(login: string, senha: string): Promise<MobileS
     );
   }
 
-  const supabase = getSupabase();
-  if (!supabase) {
-    throw new Error('Nao foi possivel ligar ao Supabase.');
-  }
+  await hydrateActiveTenantId();
+  const tenant = tenantId?.trim() || getActiveTenantId();
+  await setActiveTenantId(tenant);
 
-  const loginKey = loginTrimmed.toLowerCase();
-
-  let data: unknown;
-  let error: { message?: string } | null;
   try {
-    const res = await supabase
-      .from('usuarios_sistema')
-      .select(
-        'id,login,nome,senha,ativo,perfis_acesso(id,codigo,nome,perfil_permissoes(modulo,acao,permitido)),usuario_permissoes(modulo,acao,permitido)',
-      )
-      .eq('login', loginKey)
-      .eq('ativo', true)
-      .maybeSingle();
-    data = res.data;
-    error = res.error;
+    const rpc = await autenticarUsuarioIsoProRpc(tenant, loginTrimmed, senhaTrimmed, {
+      requiredModule: 'mobile',
+    });
+
+    if (rpc.ok) {
+      const session = sessionFromRpcUser(rpc.user, tenant);
+      await platformSetItem(SESSION_KEY, JSON.stringify(session));
+      sessionCache = session;
+      return session;
+    }
+
+    if (rpc.rpcMissing) {
+      throw new Error(
+        'Servidor Supabase desatualizado: falta a funcao iso_pro_autenticar_usuario. Execute «npx supabase db push» no projeto desktop e tente novamente.',
+      );
+    }
+
+    if (/network|fetch|timeout|failed to fetch/i.test(rpc.error)) {
+      throw new Error(
+        'Sem ligação ao Supabase (rede ou URL). Confirme internet no telemóvel, projeto Supabase ativo, e no expo.dev variáveis EXPO_PUBLIC_SUPABASE_URL e EXPO_PUBLIC_SUPABASE_ANON_KEY para o ambiente «preview» (depois gere novo build).',
+      );
+    }
+
+    throw new Error(rpc.error || 'Login ou senha invalidos.');
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     const isNet = /network request failed|failed to fetch|networkerror|aborted|timeout|typeerror.*network/i.test(
@@ -167,53 +141,11 @@ export async function loginMobile(login: string, senha: string): Promise<MobileS
     );
     if (isNet) {
       throw new Error(
-        'Sem ligação ao Supabase (rede ou URL). Confirme internet no telemóvel, projeto Supabase ativo, e no expo.dev variáveis EXPO_PUBLIC_SUPABASE_URL e EXPO_PUBLIC_SUPABASE_ANON_KEY para o ambiente «preview» (depois gere novo build).',
+        'Sem ligação ao Supabase (rede ou URL). Confirme internet no telemóvel, projeto Supabase ativo, e variáveis EXPO_PUBLIC no EAS.',
       );
     }
     throw e instanceof Error ? e : new Error(msg);
   }
-
-  if (error) {
-    const em = error.message || '';
-    if (/network request failed|failed to fetch/i.test(em)) {
-      throw new Error(
-        'Sem ligação ao Supabase. Verifique as variáveis no EAS (ambiente preview), URL https://…supabase.co e novo APK.',
-      );
-    }
-    throw new Error(em || 'Falha ao consultar utilizadores.');
-  }
-
-  const rowRaw = data as RemoteUserRow | null;
-  const storedSenha = String(rowRaw?.senha ?? '');
-  if (!rowRaw || !(await verifyPassword(senhaTrimmed, storedSenha))) {
-    throw new Error('Login ou senha invalidos.');
-  }
-
-  if (!isPasswordHash(storedSenha)) {
-    void (async () => {
-      try {
-        const hashed = await hashPassword(senhaTrimmed);
-        await supabase
-          .from('usuarios_sistema')
-          .update({ senha: hashed })
-          .eq('id', rowRaw.id)
-          .eq('login', loginKey);
-      } catch {
-        /* migração best-effort */
-      }
-    })();
-  }
-
-  const row = normalizeRemoteRow(rowRaw);
-
-  if (!hasMobileModuleAccess(row)) {
-    throw new Error('Seu perfil nao tem acesso ao aplicativo mobile. Peça ao administrador para incluir o modulo Mobile.');
-  }
-
-  const session = sessionFromRemoteUser(row);
-  await platformSetItem(SESSION_KEY, JSON.stringify(session));
-  sessionCache = session;
-  return session;
 }
 
 export async function logoutMobile(): Promise<void> {

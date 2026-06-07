@@ -17,7 +17,9 @@ import { appAlert } from '@/src/lib/appDialog';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { getAtendenteRegisto } from '@/src/lib/atendenteSessao';
 import { useDebouncedEffect } from '@/src/lib/useDebouncedEffect';
-import { commitDefaultSnapshotWrite, fetchDefaultSnapshot } from '@/src/lib/snapshot';
+import { fetchDefaultSnapshot } from '@/src/lib/snapshot';
+import { commitDefaultSnapshotWriteResilient as commitDefaultSnapshotWrite } from '@/src/lib/offlineSnapshotQueue';
+import { rotuloBotaoConfirmarGravacaoSnapshot } from '@/src/lib/snapshotWriteFeedback';
 import { useSnapshotRefreshOnAppActive } from '@/src/lib/useSnapshotRefreshOnAppActive';
 import { hasSupabaseConfig } from '@/src/lib/config';
 import {
@@ -639,11 +641,11 @@ export default function AtendimentoScreen() {
     const qConf = formatQuantidadeExibicao(q);
     appAlert(
       'Confirmar baixa por código',
-      `Gravar na nuvem?\n\nMaterial: ${matCod}\nQuantidade: ${qConf}\nPara: ${receb}\nDocumento ref.: ${docRef}\n\nProtocolo: ${res.loteNumero}`,
+      `Guardar esta baixa?\n\nMaterial: ${matCod}\nQuantidade: ${qConf}\nPara: ${receb}\nDocumento ref.: ${docRef}\n\nProtocolo: ${res.loteNumero}\n\n(Com ligacao, sincroniza na nuvem; offline fica pendente.)`,
       [
         { text: 'Cancelar', style: 'cancel' },
         {
-          text: 'Gravar na nuvem',
+          text: rotuloBotaoConfirmarGravacaoSnapshot(),
           onPress: () => {
             void (async () => {
               setSaving(true);
@@ -732,9 +734,12 @@ export default function AtendimentoScreen() {
                   String(res.material.descricao ?? '').trim() || matCod;
                 const unMat = String(res.material.unidade ?? '').trim();
                 const qLinha = formatQuantidadeExibicao(res.atendidoTotal);
+                const syncHintCodigo = result.queued
+                  ? '\n\nGuardado neste aparelho (pendente de sincronizacao com a nuvem).'
+                  : '\n\nGravado na nuvem.';
                 appAlert(
                   'Código registrado',
-                  `Deseja continuar a registar mais materiais neste atendimento ou finalizar?\n\nProduto: ${produtoLinha}\nQuantidade: ${qLinha}${unMat ? ` ${unMat}` : ''}\nProtocolo: ${res.loteNumero}${continuacao ? '\n\n(mesmo protocolo — comprovante único ao finalizar)' : ''}`,
+                  `Deseja continuar a registar mais materiais neste atendimento ou finalizar?\n\nProduto: ${produtoLinha}\nQuantidade: ${qLinha}${unMat ? ` ${unMat}` : ''}\nProtocolo: ${res.loteNumero}${syncHintCodigo}${continuacao ? '\n\n(mesmo protocolo — comprovante único ao finalizar)' : ''}`,
                   [
                     { text: 'Continuar', style: 'cancel' },
                     {
@@ -785,11 +790,11 @@ export default function AtendimentoScreen() {
     const docNum = String(doc.numero ?? '—');
     appAlert(
       'Confirmar',
-      `Deseja mesmo registar este atendimento na nuvem?\n\nDocumento: ${docNum}\nPara: ${receb}\n\nIsto grava as quantidades no planejamento. Se algo estiver errado, toque em Cancelar.`,
+      `Registar este atendimento?\n\nDocumento: ${docNum}\nPara: ${receb}\n\nGrava as quantidades no planejamento (nuvem ou fila offline). Se algo estiver errado, toque em Cancelar.`,
       [
         { text: 'Cancelar', style: 'cancel' },
         {
-          text: 'Sim',
+          text: rotuloBotaoConfirmarGravacaoSnapshot(),
           onPress: () => {
             void (async () => {
               setSaving(true);
@@ -880,9 +885,12 @@ export default function AtendimentoScreen() {
                 setSessaoAtendimentoItens(nextSessao);
                 setQtdLinha({});
                 sessaoCodigoBarrasLoteRef.current = { loteNumero: res.loteNumero, loteId: res.loteId };
+                const syncHint = result.queued
+                  ? 'Alteracao pendente de sincronizacao com a nuvem.'
+                  : 'Gravado na nuvem.';
                 appAlert(
                   'Atendimento registado',
-                  `Documento ${docNum} gravado na nuvem.\nProtocolo: ${res.loteNumero}${continuacao ? '\n(mesmo protocolo — vários itens no mesmo comprovante)' : ''}\n\nSessão para «${receb}»: ${nextSessao.length} operação(ões).\n\nDeseja continuar a registar ou finalizar o atendimento?`,
+                  `Documento ${docNum}: ${syncHint}\nProtocolo: ${res.loteNumero}${continuacao ? '\n(mesmo protocolo — vários itens no mesmo comprovante)' : ''}\n\nSessão para «${receb}»: ${nextSessao.length} operação(ões).\n\nDeseja continuar a registar ou finalizar o atendimento?`,
                   [
                     { text: 'Continuar', style: 'cancel' },
                     {

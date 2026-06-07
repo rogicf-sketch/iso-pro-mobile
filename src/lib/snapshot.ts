@@ -4,7 +4,7 @@ import {
   type IsoSnapshotPayload,
 } from 'iso-pro-shared';
 import { SUPABASE_URL } from './config';
-import { ISO_PRO_DEFAULT_TENANT_ID } from './isoProTenantConstants';
+import { getActiveTenantId } from './isoProTenant';
 import { getSupabase } from './supabase';
 import { garantirIdsDocumentosPlanejamento } from './registrarAtendimento';
 
@@ -172,7 +172,7 @@ export async function fetchSnapshotDiagnostics(): Promise<SnapshotDiagnostics> {
     .from('iso_pro_snapshot')
     .select('payload,updated_at')
     .eq('id', 'default')
-    .eq('tenant_id', ISO_PRO_DEFAULT_TENANT_ID)
+    .eq('tenant_id', getActiveTenantId())
     .maybeSingle();
 
   if (error) {
@@ -253,7 +253,7 @@ export async function fetchDefaultSnapshot(): Promise<{
     .from('iso_pro_snapshot')
     .select('payload,updated_at')
     .eq('id', 'default')
-    .eq('tenant_id', ISO_PRO_DEFAULT_TENANT_ID)
+    .eq('tenant_id', getActiveTenantId())
     .maybeSingle();
 
   if (error) {
@@ -286,7 +286,7 @@ export async function upsertDefaultSnapshot(
     const { error } = await supabase.from('iso_pro_snapshot').upsert(
       {
         id: SNAPSHOT_ID,
-        tenant_id: ISO_PRO_DEFAULT_TENANT_ID,
+        tenant_id: getActiveTenantId(),
         payload: checked.data,
         updated_at: nextUpdatedAt,
       },
@@ -305,7 +305,7 @@ export async function upsertDefaultSnapshot(
       updated_at: nextUpdatedAt,
     })
     .eq('id', SNAPSHOT_ID)
-    .eq('tenant_id', ISO_PRO_DEFAULT_TENANT_ID)
+    .eq('tenant_id', getActiveTenantId())
     .eq('updated_at', baselineUpdatedAt)
     .select('id');
 
@@ -325,7 +325,7 @@ export async function commitDefaultSnapshotWrite(
   prepare: () => Promise<SnapshotWritePlan>,
   options?: { maxAttempts?: number },
 ): Promise<UpsertDefaultSnapshotResult> {
-  const maxAttempts = Math.max(1, options?.maxAttempts ?? 3);
+  const maxAttempts = Math.max(1, options?.maxAttempts ?? 5);
   let last: UpsertDefaultSnapshotResult = {
     error: SNAPSHOT_CONFLICT_MESSAGE,
     conflict: true,

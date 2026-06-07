@@ -1,4 +1,4 @@
-﻿{
+{
     "description": "Contrato TypeScript (vendored para CI/release mobile). Origem: ../iso-pro-shared â€” atualizar com scripts/sync-vendor-iso-pro-shared.ps1",
     "type": "module",
     "types": "./dist/index.d.ts",
@@ -7,7 +7,8 @@
                   "dist"
               ],
     "dependencies": {
-                         "zod": "^4.3.6"
+                         "zod": "^4.3.6",
+                         "bcryptjs": "^2.4.3"
                      },
     "name": "iso-pro-shared",
     "private": true,

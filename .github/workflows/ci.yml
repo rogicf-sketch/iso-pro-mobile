@@ -31,24 +31,17 @@ jobs:
           node-version-file: '.nvmrc'
           cache: npm
 
-      - name: Link iso-pro-shared for npm (vendor ou monorepo)
-        shell: bash
-        run: |
-          set -euo pipefail
-          parent="$(dirname "$GITHUB_WORKSPACE")"
-          target="$parent/iso-pro-shared"
-          if [ -f "$target/package.json" ]; then
-            echo "Usando iso-pro-shared já presente em $target"
-          elif [ -f vendor/iso-pro-shared/package.json ]; then
-            ln -sfn "$GITHUB_WORKSPACE/vendor/iso-pro-shared" "$target"
-            echo "Symlink vendor → $target"
-          else
-            echo "::error::iso-pro-shared ausente. Corra scripts/sync-vendor-iso-pro-shared.ps1 e commit vendor/."
-            exit 1
-          fi
-
       - name: Install dependencies
         run: npm ci
 
       - name: CI (typecheck, test, lint, audit)
         run: npm run ci
+
+      - name: Maestro E2E (login validacao, opcional)
+        continue-on-error: true
+        run: |
+          if command -v maestro >/dev/null 2>&1; then
+            maestro test .maestro/login-validacao.yaml
+          else
+            echo "Maestro CLI ausente — ignorado. Instale: https://maestro.mobile.dev"
+          fi

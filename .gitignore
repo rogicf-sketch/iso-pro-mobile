@@ -4,7 +4,8 @@ android/
 ios/
 .expo/
 dist/
-# Contrato Zod vendored para CI (npm file:../iso-pro-shared)
+dist-eas-test*/
+# Contrato Zod vendored para CI/EAS (npm file:./vendor/iso-pro-shared)
 !vendor/iso-pro-shared/dist/
 npm-debug.*
 *.jks

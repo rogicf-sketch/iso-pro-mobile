@@ -28,7 +28,8 @@ import {
   linhaEstadoConferenciaMobile,
   recebimentoPermiteEditarConferencia,
 } from '@/src/lib/recebimentoConferenciaMobile';
-import { commitDefaultSnapshotWrite, fetchDefaultSnapshot } from '@/src/lib/snapshot';
+import { fetchDefaultSnapshot } from '@/src/lib/snapshot';
+import { commitDefaultSnapshotWriteResilient as commitDefaultSnapshotWrite } from '@/src/lib/offlineSnapshotQueue';
 import { hasSupabaseConfig } from '@/src/lib/config';
 import { formatarDataHoraLocal } from '@/src/lib/formatData';
 import {
@@ -429,7 +430,12 @@ export default function ConferenciaScreen() {
         }
         await limparRascunhoConferencia();
         if (!opts?.silentSuccess) {
-          appAlert('Guardado', 'Quantidades conferidas gravadas na nuvem.');
+          appAlert(
+            result.queued ? 'Guardado (pendente)' : 'Guardado',
+            result.queued
+              ? 'Quantidades conferidas guardadas neste aparelho e enfileiradas para sincronizar com a nuvem.'
+              : 'Quantidades conferidas gravadas na nuvem.',
+          );
         }
         return true;
       } finally {

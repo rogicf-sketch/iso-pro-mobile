@@ -57,7 +57,7 @@ Depois de alterar `iso-pro-shared` na pasta mestre, atualize o vendor antes de c
 
 ## Release para obra (APK / EAS)
 
-Antes de distribuir build a campo (**versão atual: 1.0.20**, `android.versionCode` **21** em `app.config.ts`):
+Antes de distribuir build a campo (**versão atual: 1.0.22**, `android.versionCode` **23** em `app.config.ts`):
 
 1. `npm run ci` nesta pasta.
 2. Seguir o checklist manual: [`docs/checklist-release-campo.md`](docs/checklist-release-campo.md) (sync, conferência com destravar, atendimento, recibos — ~15–20 min com telemóvel + PC na mesma nuvem).

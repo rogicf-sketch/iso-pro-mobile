@@ -14,6 +14,11 @@ export type MobileDeviceRecord = {
   bloqueado: boolean;
   usuarioLogin: string;
   ultimoAcessoEm: string;
+  /** Última validação bem-sucedida no Supabase (ISO). */
+  ultimaValidacaoRemotaEm?: string;
+  /** Estado remoto congelado na última validação (revogação offline). */
+  remotoAutorizado?: boolean;
+  remotoBloqueado?: boolean;
 };
 
 async function getOrCreateDeviceId() {

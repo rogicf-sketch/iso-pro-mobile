@@ -8,6 +8,9 @@ import { getStoredDeviceRecord, registerDevice, saveDeviceRecord } from './mobil
 vi.mock('./supabase', () => ({
   getSupabase: vi.fn(),
 }));
+vi.mock('./isoProTenant', () => ({
+  getActiveTenantId: () => '00000000-0000-0000-0000-000000000001',
+}));
 
 vi.mock('./mobileDevice', () => ({
   getStoredDeviceRecord: vi.fn(),
@@ -20,6 +23,7 @@ const session: MobileSession = {
   login: 'op@empresa.pt',
   nome: 'Operador',
   perfil: 'campo',
+  tenantId: '00000000-0000-0000-0000-000000000001',
 };
 
 const device: MobileDeviceRecord = {
@@ -52,7 +56,8 @@ describe('resolveMobileAccess', () => {
     const res = await resolveMobileAccess(session);
 
     expect(res.source).toBe('local');
-    expect(res.warning).toBeNull();
+    expect(res.offlineUnverified).toBe(true);
+    expect(res.warning).toContain('Supabase');
     expect(res.device.deviceId).toBe(device.deviceId);
     expect(vi.mocked(saveDeviceRecord)).toHaveBeenCalled();
   });
@@ -71,7 +76,8 @@ describe('resolveMobileAccess', () => {
     const res = await resolveMobileAccess(session);
 
     expect(res.source).toBe('local');
-    expect(res.warning).toBe('Falha de rede / RLS');
+    expect(res.offlineUnverified).toBe(true);
+    expect(res.warning).toContain('offline');
   });
 
   it('erro no upsert mantém local e preenche warning', async () => {
@@ -107,7 +113,8 @@ describe('resolveMobileAccess', () => {
     const res = await resolveMobileAccess(session);
 
     expect(res.source).toBe('local');
-    expect(res.warning).toBe('upsert falhou');
+    expect(res.offlineUnverified).toBe(true);
+    expect(res.warning).toContain('offline');
   });
 
   it('sucesso remoto grava dispositivo fundido e devolve source supabase', async () => {
@@ -119,12 +126,12 @@ describe('resolveMobileAccess', () => {
         }
         dispositivosCalls += 1;
         if (dispositivosCalls === 1) {
+          const chain = {
+            eq: () => chain,
+            maybeSingle: async () => ({ data: null, error: null }),
+          };
           return {
-            select: () => ({
-              eq: () => ({
-                maybeSingle: async () => ({ data: null, error: null }),
-              }),
-            }),
+            select: () => chain,
           };
         }
         return {
@@ -155,7 +162,9 @@ describe('resolveMobileAccess', () => {
 
     expect(res.source).toBe('supabase');
     expect(res.warning).toBeNull();
+    expect(res.offlineUnverified).toBe(false);
     expect(res.state).toBe('authorized');
+    expect(res.device.ultimaValidacaoRemotaEm).toBeTruthy();
     expect(res.device.autorizado).toBe(true);
     expect(vi.mocked(saveDeviceRecord)).toHaveBeenCalled();
   });

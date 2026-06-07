@@ -22,6 +22,8 @@ Copy-Item -Recurse -Force (Join-Path $MonoShared 'dist') (Join-Path $Vendor 'dis
 $srcPkg = Get-Content (Join-Path $MonoShared 'package.json') -Raw | ConvertFrom-Json
 $zod = $srcPkg.dependencies.zod
 if (-not $zod) { $zod = '^4.3.6' }
+$bcryptjs = $srcPkg.dependencies.bcryptjs
+if (-not $bcryptjs) { $bcryptjs = '^2.4.3' }
 
 $vendorPkg = @{
   name        = 'iso-pro-shared'
@@ -37,12 +39,14 @@ $vendorPkg = @{
     './validators' = @{ types = './dist/validators.d.ts'; default = './dist/validators.js' }
   }
   files        = @('dist')
-  dependencies = @{ zod = $zod }
+  dependencies = @{ zod = $zod; bcryptjs = $bcryptjs }
 }
 
 $json = $vendorPkg | ConvertTo-Json -Depth 6
 # PowerShell 5.x indenta com 2 espaços; normalizar para JSON legível
 $json = $json -replace '":  ', '": '
-Set-Content -Path (Join-Path $Vendor 'package.json') -Value $json -Encoding utf8
+$vendorPkgPath = Join-Path $Vendor 'package.json'
+$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+[System.IO.File]::WriteAllText($vendorPkgPath, $json, $utf8NoBom)
 
 Write-Host 'vendor/iso-pro-shared atualizado (dist + package.json).' -ForegroundColor Green

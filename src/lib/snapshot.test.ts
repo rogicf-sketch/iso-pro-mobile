@@ -15,6 +15,9 @@ vi.mock('./config', () => ({
 vi.mock('./supabase', () => ({
   getSupabase: vi.fn(),
 }));
+vi.mock('./isoProTenant', () => ({
+  getActiveTenantId: () => '00000000-0000-0000-0000-000000000001',
+}));
 
 const payloadMinimo = {
   documentos: [],

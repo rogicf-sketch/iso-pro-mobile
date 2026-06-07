@@ -9,6 +9,7 @@ import {
   getStoredMobileSession,
   runAuthStorageMigration,
 } from '@/src/lib/mobileAuth';
+import { hydrateActiveTenantId } from '@/src/lib/isoProTenant';
 import { captureException } from '@/src/lib/errorReporting';
 import { resolveMobileAccess } from '@/src/lib/mobileAccess';
 import { initSentryMobile, Sentry } from '@/src/lib/sentryRN';
@@ -54,6 +55,7 @@ function RootLayoutInner() {
       try {
         await runAuthStorageMigration();
         await clearSessionOnFirstLaunchAfterInstall();
+        await hydrateActiveTenantId();
         const session = await getStoredMobileSession();
         if (cancelled) return;
 
@@ -76,6 +78,7 @@ function RootLayoutInner() {
       } catch (err) {
         captureException(err, { where: 'RootLayoutInner/session-bootstrap' });
         hideSplashOnce();
+        router.replace('/bootstrap-error');
       }
     })();
 
@@ -145,6 +148,7 @@ function RootLayoutInner() {
         }}
       >
         <Stack.Screen name="login" options={{ headerShown: false }} />
+        <Stack.Screen name="bootstrap-error" options={{ title: 'Erro ao iniciar' }} />
         <Stack.Screen name="device-pending" options={{ headerShown: false }} />
         <Stack.Screen name="device-blocked" options={{ headerShown: false }} />
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />

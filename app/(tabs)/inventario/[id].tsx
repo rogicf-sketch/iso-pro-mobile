@@ -12,7 +12,8 @@ import { appAlert } from '@/src/lib/appDialog';
 import { buildInventarioStyles } from '@/src/theme/buildInventarioStyles';
 import { useMobileUiPreferences } from '@/src/theme/MobileUiPreferencesContext';
 import { useTheme } from '@/src/theme/ThemeContext';
-import { commitDefaultSnapshotWrite, fetchDefaultSnapshot } from '@/src/lib/snapshot';
+import { fetchDefaultSnapshot } from '@/src/lib/snapshot';
+import { commitDefaultSnapshotWriteResilient as commitDefaultSnapshotWrite } from '@/src/lib/offlineSnapshotQueue';
 import { useSnapshotRefreshOnAppActive } from '@/src/lib/useSnapshotRefreshOnAppActive';
 import { hasSupabaseConfig } from '@/src/lib/config';
 import { formatarDataHoraLocal } from '@/src/lib/formatData';
@@ -240,7 +241,12 @@ export default function InventarioDetalheScreen() {
         }
         await limparRascunhoInventario(id);
         if (!opts?.silentSuccess) {
-          appAlert('Guardado', 'Quantidades contadas gravadas na nuvem.');
+          appAlert(
+            result.queued ? 'Guardado (pendente)' : 'Guardado',
+            result.queued
+              ? 'Quantidades contadas guardadas neste aparelho e enfileiradas para sincronizar com a nuvem.'
+              : 'Quantidades contadas gravadas na nuvem.',
+          );
         }
         return true;
       } finally {

@@ -1,12 +1,21 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import Constants from 'expo-constants';
 import { useRouter } from 'expo-router';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import { AuthScreenLayout } from '@/src/components/AuthScreenLayout';
 import { BrandLogoPanel } from '@/src/components/BrandLogoPanel';
 import { loginMobile } from '@/src/lib/mobileAuth';
 import { resolveMobileAccess } from '@/src/lib/mobileAccess';
+import {
+  getActiveTenantId,
+  getBuildTimeTenantId,
+  hydrateActiveTenantId,
+  setActiveTenantId,
+  type IsoProTenantListItem,
+} from '@/src/lib/isoProTenant';
+import { hasSupabaseConfig } from '@/src/lib/config';
+import { getSupabase } from '@/src/lib/supabase';
 import { neonPrimaryButtonExtras } from '@/src/theme/neonButtonExtras';
 import { useTheme } from '@/src/theme/ThemeContext';
 
@@ -23,6 +32,28 @@ export default function LoginScreen() {
   const [senhaVisivel, setSenhaVisivel] = useState(false);
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
+  const [tenants, setTenants] = useState<IsoProTenantListItem[]>([]);
+  const [tenantId, setTenantId] = useState(getBuildTimeTenantId());
+
+  useEffect(() => {
+    void (async () => {
+      await hydrateActiveTenantId();
+      setTenantId(getActiveTenantId());
+      if (!hasSupabaseConfig()) return;
+      const supabase = getSupabase();
+      if (!supabase) return;
+      const { data, error: tenantsErr } = await supabase.from('iso_pro_tenants').select('id,slug,name').order('name');
+      if (tenantsErr || !data?.length) return;
+      const list = data.map((row) => ({
+        id: String(row.id),
+        slug: String((row as { slug?: string }).slug ?? ''),
+        name: String((row as { name?: string }).name ?? ''),
+      }));
+      setTenants(list);
+      const preferred = list.find((t) => t.id === getBuildTimeTenantId()) ?? list[0];
+      if (preferred) setTenantId(preferred.id);
+    })();
+  }, []);
 
   const styles = StyleSheet.create({
     card: {
@@ -91,7 +122,8 @@ export default function LoginScreen() {
     setSaving(true);
     setError('');
     try {
-      const session = await loginMobile(login.trim(), senha);
+      await setActiveTenantId(tenantId);
+      const session = await loginMobile(login.trim(), senha, tenantId);
       const access = await resolveMobileAccess(session);
 
       if (access.state === 'blocked') {
@@ -132,6 +164,33 @@ export default function LoginScreen() {
           Se aparecer «network request failed» ou erro de rede, a senha nem e verificada: falta ligação ao Supabase (variáveis EXPO_PUBLIC_* no EAS,
           ambiente preview, e novo APK). Não existe login «admin/admin» por defeito na app — tem de existir em Utilizadores na base de dados.
         </Text>
+
+        {tenants.length > 1 ? (
+          <View>
+            <Text style={styles.label}>Empresa</Text>
+            <View style={{ gap: 8 }}>
+              {tenants.map((t) => {
+                const selected = t.id === tenantId;
+                return (
+                  <Pressable
+                    key={t.id}
+                    onPress={() => setTenantId(t.id)}
+                    style={({ pressed }) => [
+                      styles.input,
+                      {
+                        paddingVertical: 12,
+                        borderColor: selected ? colors.accent : colors.border,
+                        opacity: pressed ? 0.85 : 1,
+                      },
+                    ]}
+                  >
+                    <Text style={{ color: colors.text, fontWeight: selected ? '800' : '500' }}>{t.name}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+          </View>
+        ) : null}
 
         <View>
           <Text style={styles.label}>Login</Text>
