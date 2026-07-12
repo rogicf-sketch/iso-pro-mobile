@@ -13,7 +13,10 @@ import { buildInventarioStyles } from '@/src/theme/buildInventarioStyles';
 import { useMobileUiPreferences } from '@/src/theme/MobileUiPreferencesContext';
 import { useTheme } from '@/src/theme/ThemeContext';
 import { fetchDefaultSnapshot } from '@/src/lib/snapshot';
-import { commitDefaultSnapshotWriteResilient as commitDefaultSnapshotWrite } from '@/src/lib/offlineSnapshotQueue';
+import { commitDefaultSnapshotPatchWriteResilient as commitDefaultSnapshotWrite } from '@/src/lib/offlineSnapshotQueue';
+import { createSnapshotPatchPrepareWithBaseline } from '@/src/lib/snapshotWritePrepare';
+import { buildInventarioContagemPatchPlan } from '@/src/lib/inventarioSnapshotPatch';
+import { SNAPSHOT_MOBILE_INVENTARIO_WRITE_READ_KEYS } from '@/src/lib/snapshotSliceKeys';
 import { useSnapshotRefreshOnAppActive } from '@/src/lib/useSnapshotRefreshOnAppActive';
 import { hasSupabaseConfig } from '@/src/lib/config';
 import { formatarDataHoraLocal } from '@/src/lib/formatData';
@@ -205,23 +208,25 @@ export default function InventarioDetalheScreen() {
       }
       setSaving(true);
       try {
-        const result = await commitDefaultSnapshotWrite(async () => {
-          const { payload: fresh, updatedAt, error } = await fetchDefaultSnapshot();
-          if (error) {
-            throw new Error(error);
-          }
-          if (!fresh?.inventarios?.length) {
-            throw new Error('Não foi possível localizar o inventário no pacote.');
-          }
-          const nextPayload = deepClone(fresh);
-          const idx = nextPayload.inventarios!.findIndex((inv) => String(inv.id) === String(id));
-          if (idx === -1) {
-            throw new Error('Não foi possível localizar o inventário no pacote.');
-          }
-          nextPayload.inventarios![idx] = deepClone(localInventario);
-          nextPayload.dataAtualizacao = new Date().toISOString();
-          return { nextPayload, baselineUpdatedAt: updatedAt };
-        });
+        let inventarioMerged: InventarioSnapshot | null = null;
+        const result = await commitDefaultSnapshotWrite(
+          createSnapshotPatchPrepareWithBaseline(null, SNAPSHOT_MOBILE_INVENTARIO_WRITE_READ_KEYS, (fresh) => {
+            if (!fresh?.inventarios?.length) {
+              throw new Error('Não foi possível localizar o inventário no pacote.');
+            }
+            const plan = buildInventarioContagemPatchPlan({
+              freshInventarios: fresh.inventarios,
+              inventarioId: String(id),
+              localInventario: deepClone(localInventario) as Record<string, unknown>,
+            });
+            inventarioMerged = plan.inventarioMerged as InventarioSnapshot;
+            return {
+              patch: plan.patch,
+              mergeKeys: plan.mergeKeys,
+              patchWithoutMerge: plan.patchWithoutMerge,
+            };
+          }),
+        );
         if (result.error) {
           appAlert(result.conflict ? 'Conflito de dados' : 'Supabase', result.error);
           if (result.conflict) {
@@ -231,8 +236,8 @@ export default function InventarioDetalheScreen() {
         }
         const nextPayload = deepClone(payload);
         const idx = nextPayload.inventarios?.findIndex((inv) => String(inv.id) === String(id)) ?? -1;
-        if (idx !== -1 && nextPayload.inventarios) {
-          nextPayload.inventarios[idx] = deepClone(localInventario);
+        if (idx !== -1 && nextPayload.inventarios && inventarioMerged) {
+          nextPayload.inventarios[idx] = deepClone(inventarioMerged);
           nextPayload.dataAtualizacao = new Date().toISOString();
           setPayload(nextPayload);
         }

@@ -4,8 +4,21 @@ import {
   type IsoSnapshotPayload,
 } from 'iso-pro-shared';
 import { SUPABASE_URL } from './config';
+import {
+  commitIsoProSnapshotPatch,
+  invalidateIsoProSnapshotCache,
+  isIsoProSnapshotConflictError,
+  listDocumentosPendenciaMaterialFromCloud,
+  readDocumentoPlanejamentoFromCloud,
+  readIsoProSnapshotSlicesForWrite,
+  readIsoProSnapshotSlicesWithUpdatedAt,
+  readIsoProSnapshotStats,
+  type IsoProSnapshotPatchPlan,
+} from './isoProSnapshot';
 import { getActiveTenantId } from './isoProTenant';
 import { getSupabase } from './supabase';
+import { formatOperadorNetworkError } from './formatOperadorNetworkError';
+import { captureOperationalEvent } from './errorReporting';
 import { garantirIdsDocumentosPlanejamento } from './registrarAtendimento';
 
 const SNAPSHOT_ID = 'default';
@@ -19,6 +32,108 @@ export type UpsertDefaultSnapshotResult = {
   conflict: boolean;
   updatedAt: string | null;
 };
+
+export type SnapshotPatchPlan = IsoProSnapshotPatchPlan;
+
+export type SnapshotSliceFetchResult = {
+  payload: IsoSnapshotPayload | null;
+  updatedAt: string | null;
+  error: string | null;
+};
+
+/** Extrai chaves alteradas para patch parcial na nuvem. */
+export function buildSnapshotPatchFromNext(
+  next: IsoSnapshotPayload,
+  keys: readonly string[],
+): Record<string, unknown> {
+  const rec = next as Record<string, unknown>;
+  const patch: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (key in rec) {
+      patch[key] = rec[key];
+    }
+  }
+  return patch;
+}
+
+/** Leitura parcial (RPC `iso_pro_read_snapshot_slices` ou select jsonb). */
+export async function fetchSnapshotSlices(
+  keys: readonly string[],
+  options?: { bypassCache?: boolean },
+): Promise<SnapshotSliceFetchResult> {
+  const supabase = getSupabase();
+  if (!supabase) {
+    return {
+      payload: null,
+      updatedAt: null,
+      error: 'Supabase não configurado (EXPO_PUBLIC_SUPABASE_URL / EXPO_PUBLIC_SUPABASE_ANON_KEY).',
+    };
+  }
+  try {
+    const { slices, updatedAt } = await readIsoProSnapshotSlicesWithUpdatedAt<Record<string, unknown>>(keys, options);
+    const { payload, error } = guardAndEnrichSnapshotFromRemote(slices);
+    return { payload, updatedAt, error };
+  } catch (err) {
+    return {
+      payload: null,
+      updatedAt: null,
+      error: formatOperadorNetworkError(err, { contexto: 'carregar' }),
+    };
+  }
+}
+
+/** Leitura fresca de fatias + baseline (para gravacao com patch). */
+export async function fetchSnapshotSlicesForWrite(keys: readonly string[]): Promise<SnapshotSliceFetchResult> {
+  const supabase = getSupabase();
+  if (!supabase) {
+    return {
+      payload: null,
+      updatedAt: null,
+      error: 'Supabase não configurado (EXPO_PUBLIC_SUPABASE_URL / EXPO_PUBLIC_SUPABASE_ANON_KEY).',
+    };
+  }
+  try {
+    const { slices, baselineUpdatedAt } = await readIsoProSnapshotSlicesForWrite(keys);
+    const { payload, error } = guardAndEnrichSnapshotFromRemote(slices);
+    return { payload, updatedAt: baselineUpdatedAt, error };
+  } catch (err) {
+    return {
+      payload: null,
+      updatedAt: null,
+      error: formatOperadorNetworkError(err, { contexto: 'carregar' }),
+    };
+  }
+}
+
+/**
+ * Grava patch parcial com retry (RPC `iso_pro_patch_snapshot` + fallback gravacao completa).
+ */
+export async function commitDefaultSnapshotPatchWrite(
+  prepare: () => Promise<SnapshotPatchPlan>,
+  options?: { maxAttempts?: number },
+): Promise<UpsertDefaultSnapshotResult> {
+  try {
+    await commitIsoProSnapshotPatch(prepare, options);
+    return { error: null, conflict: false, updatedAt: new Date().toISOString() };
+  } catch (err) {
+    if (isIsoProSnapshotConflictError(err)) {
+      captureOperationalEvent('snapshot_conflict', { source: 'patch' }, 'warning');
+      return { error: SNAPSHOT_CONFLICT_MESSAGE, conflict: true, updatedAt: null };
+    }
+    const message = err instanceof Error ? err.message : 'Falha ao gravar patch do snapshot.';
+    return { error: message, conflict: false, updatedAt: null };
+  }
+}
+
+export { invalidateIsoProSnapshotCache };
+
+export {
+  listDocumentosPendenciaMaterialFromCloud,
+  listDocumentosPlanejamentoResumoFromCloud,
+  readDocumentoPlanejamentoFromCloud,
+  reservarNumeroAtendimentoFromCloud,
+  searchDocumentosPlanejamentoFromCloud,
+} from './isoProSnapshot';
 
 export type SnapshotWritePlan = {
   nextPayload: IsoSnapshotPayload;
@@ -150,7 +265,7 @@ export type SnapshotDiagnostics = {
   primeiroNumeroDocumento: string | null;
 };
 
-/** Leitura única para ecrã de diagnóstico (Início). */
+/** Leitura única para ecrã de diagnóstico (Início) — fatias leves + stats opcionais. */
 export async function fetchSnapshotDiagnostics(): Promise<SnapshotDiagnostics> {
   const host = getSupabaseHostHint();
   const supabase = getSupabase();
@@ -168,16 +283,53 @@ export async function fetchSnapshotDiagnostics(): Promise<SnapshotDiagnostics> {
       primeiroNumeroDocumento: null,
     };
   }
-  const { data, error } = await supabase
-    .from('iso_pro_snapshot')
-    .select('payload,updated_at')
-    .eq('id', 'default')
-    .eq('tenant_id', getActiveTenantId())
-    .maybeSingle();
 
-  if (error) {
+  try {
+    const stats = await readIsoProSnapshotStats().catch(() => null);
+    const { payload, updatedAt, error } = await fetchSnapshotSlices([
+      'documentos',
+      'materiais',
+      'recebimentos',
+      'colaboradores',
+    ]);
+
+    if (error) {
+      return {
+        error,
+        host,
+        updatedAt: stats?.updatedAt ?? updatedAt,
+        rowFound: false,
+        documentos: 0,
+        materiais: 0,
+        recebimentos: 0,
+        colaboradores: 0,
+        payloadKeys: [],
+        primeiroNumeroDocumento: null,
+      };
+    }
+
+    const docs = payload?.documentos ?? [];
+    const mats = payload?.materiais ?? [];
+    const recs = payload?.recebimentos ?? [];
+    const cols = payload?.colaboradores ?? [];
+    const primeiro = docs[0] ? String((docs[0] as DocumentoPlanejamento).numero ?? '') : null;
+
     return {
-      error: error.message,
+      error: null,
+      host,
+      updatedAt: stats?.updatedAt ?? updatedAt,
+      rowFound: Boolean(payload),
+      documentos: docs.length,
+      materiais: mats.length,
+      recebimentos: recs.length,
+      colaboradores: cols.length,
+      payloadKeys: payload ? ['documentos', 'materiais', 'recebimentos', 'colaboradores'] : [],
+      primeiroNumeroDocumento: primeiro || null,
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Falha ao ler diagnóstico do snapshot.';
+    return {
+      error: message,
       host,
       updatedAt: null,
       rowFound: false,
@@ -189,55 +341,6 @@ export async function fetchSnapshotDiagnostics(): Promise<SnapshotDiagnostics> {
       primeiroNumeroDocumento: null,
     };
   }
-
-  if (!data?.payload || typeof data.payload !== 'object') {
-    return {
-      error: null,
-      host,
-      updatedAt: data?.updated_at ?? null,
-      rowFound: Boolean(data),
-      documentos: 0,
-      materiais: 0,
-      recebimentos: 0,
-      colaboradores: 0,
-      payloadKeys: [],
-      primeiroNumeroDocumento: null,
-    };
-  }
-
-  const { payload, error: parseError } = guardAndEnrichSnapshotFromRemote(data.payload);
-  if (parseError) {
-    return {
-      error: parseError,
-      host,
-      updatedAt: data.updated_at ?? null,
-      rowFound: true,
-      documentos: 0,
-      materiais: 0,
-      recebimentos: 0,
-      colaboradores: 0,
-      payloadKeys: Object.keys(data.payload as object).slice(0, 24),
-      primeiroNumeroDocumento: null,
-    };
-  }
-  const docs = payload?.documentos ?? [];
-  const mats = payload?.materiais ?? [];
-  const recs = payload?.recebimentos ?? [];
-  const cols = payload?.colaboradores ?? [];
-  const primeiro = docs[0] ? String((docs[0] as DocumentoPlanejamento).numero ?? '') : null;
-
-  return {
-    error: null,
-    host,
-    updatedAt: data.updated_at ?? null,
-    rowFound: true,
-    documentos: docs.length,
-    materiais: mats.length,
-    recebimentos: recs.length,
-    colaboradores: cols.length,
-    payloadKeys: Object.keys(data.payload as object).slice(0, 24),
-    primeiroNumeroDocumento: primeiro || null,
-  };
 }
 
 export async function fetchDefaultSnapshot(): Promise<{
@@ -295,6 +398,7 @@ export async function upsertDefaultSnapshot(
     if (error) {
       return { error: error.message, conflict: false, updatedAt: null };
     }
+    invalidateIsoProSnapshotCache();
     return { error: null, conflict: false, updatedAt: nextUpdatedAt };
   }
 
@@ -315,6 +419,7 @@ export async function upsertDefaultSnapshot(
   if (!data?.length) {
     return { error: SNAPSHOT_CONFLICT_MESSAGE, conflict: true, updatedAt: null };
   }
+  invalidateIsoProSnapshotCache();
   return { error: null, conflict: false, updatedAt: nextUpdatedAt };
 }
 
@@ -348,5 +453,6 @@ export async function commitDefaultSnapshotWrite(
     }
   }
 
+  captureOperationalEvent('snapshot_conflict', { attempts: maxAttempts }, 'warning');
   return last;
 }

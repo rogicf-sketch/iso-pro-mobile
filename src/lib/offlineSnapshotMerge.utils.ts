@@ -47,7 +47,8 @@ function mergeInventarioItensById(
   return Array.from(byId.values());
 }
 
-function mergeInventarioRecord(
+/** Funde um inventário local sobre o da nuvem (itens por id, max quantidadeContada). */
+export function mergeInventarioRecord(
   cloud: Record<string, unknown>,
   queued: Record<string, unknown>,
 ): Record<string, unknown> {
