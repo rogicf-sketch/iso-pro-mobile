@@ -48,6 +48,37 @@ describe('mergeSnapshotForOfflineReplay', () => {
     expect(merged.inventarios?.[1]?.id).toBe('inv-2');
   });
 
+  it('fundir itens por id nao apaga contagem maior da nuvem', () => {
+    const fresh = {
+      inventarios: [
+        {
+          id: 'inv-1',
+          status: 'aberto' as const,
+          itens: [
+            { id: 'a', quantidadeContada: 10 },
+            { id: 'b', quantidadeContada: 0 },
+          ],
+        },
+      ],
+    };
+    const queued = {
+      inventarios: [
+        {
+          id: 'inv-1',
+          status: 'aberto' as const,
+          itens: [
+            { id: 'a', quantidadeContada: 0 },
+            { id: 'b', quantidadeContada: 4 },
+          ],
+        },
+      ],
+    };
+    const merged = mergeSnapshotForOfflineReplay(fresh, queued);
+    const itens = merged.inventarios?.[0]?.itens ?? [];
+    expect(itens.find((i) => i.id === 'a')?.quantidadeContada).toBe(10);
+    expect(itens.find((i) => i.id === 'b')?.quantidadeContada).toBe(4);
+  });
+
   it('nao sobrescreve saldoAtual da nuvem quando offline diverge', () => {
     const fresh = {
       materiais: [{ codigo: 'M1', saldoAtual: 100 }],

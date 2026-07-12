@@ -13,6 +13,61 @@ function historicoEntryKey(entry: Record<string, unknown>): string {
   return `fallback:${lote}|${codigo}|${data}`;
 }
 
+function mergeInventarioItensById(
+  cloudItens: Array<Record<string, unknown>>,
+  queuedItens: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  const byId = new Map<string, Record<string, unknown>>();
+  for (const item of cloudItens) {
+    const id = String(item.id ?? '').trim();
+    if (!id) continue;
+    byId.set(id, deepClone(item));
+  }
+  for (const qItem of queuedItens) {
+    const id = String(qItem.id ?? '').trim();
+    if (!id) continue;
+    const cloud = byId.get(id);
+    if (!cloud) {
+      byId.set(id, deepClone(qItem));
+      continue;
+    }
+    const qQtd = Number(qItem.quantidadeContada ?? 0);
+    const cQtd = Number(cloud.quantidadeContada ?? 0);
+    if (Number.isFinite(qQtd) && qQtd > cQtd) {
+      cloud.quantidadeContada = qQtd;
+    }
+    const qLoc = String(qItem.localizacaoContada ?? '').trim();
+    if (qLoc && !String(cloud.localizacaoContada ?? '').trim()) {
+      cloud.localizacaoContada = qLoc;
+    } else if (qLoc && Number.isFinite(qQtd) && qQtd >= cQtd) {
+      // Mesma linha: localização acompanha a contagem vencedora.
+      cloud.localizacaoContada = qLoc;
+    }
+  }
+  return Array.from(byId.values());
+}
+
+function mergeInventarioRecord(
+  cloud: Record<string, unknown>,
+  queued: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = deepClone(cloud);
+  const cloudItens = Array.isArray(cloud.itens) ? (cloud.itens as Array<Record<string, unknown>>) : [];
+  const queuedItens = Array.isArray(queued.itens) ? (queued.itens as Array<Record<string, unknown>>) : [];
+  merged.itens = mergeInventarioItensById(cloudItens, queuedItens);
+
+  const cloudStatus = String(cloud.status ?? '').toLowerCase();
+  if (cloudStatus !== 'fechado' && cloudStatus !== 'cancelado' && queued.status != null) {
+    merged.status = queued.status;
+  }
+  for (const key of ['observacoes', 'responsavel', 'descricao', 'contagemMobileHabilitada'] as const) {
+    if (queued[key] != null && queued[key] !== '') {
+      merged[key] = queued[key];
+    }
+  }
+  return merged;
+}
+
 /** Mescla payload offline sobre snapshot fresco antes de enviar à nuvem. */
 export function mergeSnapshotForOfflineReplay(
   fresh: IsoSnapshotPayload,
@@ -98,13 +153,18 @@ export function mergeSnapshotForOfflineReplay(
     const byId = new Map(
       (merged.inventarios ?? []).map((inv) => [
         String((inv as { id?: unknown }).id ?? ''),
-        deepClone(inv),
+        deepClone(inv) as Record<string, unknown>,
       ]),
     );
     for (const inv of queuedNext.inventarios) {
       const id = String((inv as { id?: unknown }).id ?? '').trim();
       if (!id) continue;
-      byId.set(id, deepClone(inv));
+      const cloud = byId.get(id);
+      if (!cloud) {
+        byId.set(id, deepClone(inv) as Record<string, unknown>);
+        continue;
+      }
+      byId.set(id, mergeInventarioRecord(cloud, inv as Record<string, unknown>));
     }
     merged.inventarios = Array.from(byId.values()) as IsoSnapshotPayload['inventarios'];
   }
