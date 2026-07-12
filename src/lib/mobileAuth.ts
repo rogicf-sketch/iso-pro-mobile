@@ -1,7 +1,59 @@
-import { hasSupabaseConfig } from './config';
-import { autenticarUsuarioIsoProRpc } from './isoProAuthRpc';
+import { hasSupabaseConfig, getSupabaseHostHintForUser } from './config';
+import {
+  authenticateIsoProPreferJwt,
+  clearIsoProJwtSession,
+  verifyIsoProMfaChallenge,
+} from './isoProJwtSession';
 import { getActiveTenantId, hydrateActiveTenantId, setActiveTenantId } from './isoProTenant';
 import { platformDeleteItem, platformGetItem, platformSetItem } from './platformStorage';
+
+export type MobileSession = {
+  userId: string;
+  login: string;
+  nome: string;
+  perfil: string;
+  tenantId: string;
+};
+
+export class IsoProMfaRequiredError extends Error {
+  readonly factorId: string;
+  readonly pendingSession: MobileSession;
+
+  constructor(factorId: string, pendingSession: MobileSession) {
+    super('Introduza o codigo do authenticator (MFA).');
+    this.name = 'IsoProMfaRequiredError';
+    this.factorId = factorId;
+    this.pendingSession = pendingSession;
+  }
+}
+
+export function isIsoProMfaRequiredError(error: unknown): error is IsoProMfaRequiredError {
+  return error instanceof IsoProMfaRequiredError;
+}
+
+const LOGIN_RPC_TIMEOUT_MS = 20_000;
+
+function mensagemFalhaRedeSupabase(): string {
+  const host = getSupabaseHostHintForUser();
+  if (!hasSupabaseConfig()) {
+    return 'Supabase não configurado neste APK. Gere novo build com EXPO_PUBLIC_SUPABASE_URL e EXPO_PUBLIC_SUPABASE_ANON_KEY no .env (ou EAS Secrets).';
+  }
+  return host
+    ? `Sem ligação ao Supabase (${host}). Verifique Wi‑Fi/dados e tente novamente.`
+    : 'Sem ligação ao Supabase. Verifique Wi‑Fi/dados e tente novamente.';
+}
+
+async function preferJwtComTimeout(
+  loginTrimmed: string,
+  senhaTrimmed: string,
+): Promise<Awaited<ReturnType<typeof authenticateIsoProPreferJwt>>> {
+  return await Promise.race([
+    authenticateIsoProPreferJwt(loginTrimmed, senhaTrimmed, { requiredModule: 'mobile' }),
+    new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error('LOGIN_TIMEOUT')), LOGIN_RPC_TIMEOUT_MS);
+    }),
+  ]);
+}
 
 /** v2: builds antigos usavam v1 — assim forçamos novo login após atualizar o APK (resolve «entra direto» com sessão velha). */
 const SESSION_KEY = 'iso_pro_mobile_session_v2';
@@ -28,14 +80,6 @@ export async function clearSessionOnFirstLaunchAfterInstall(): Promise<void> {
   sessionCache = null;
   await platformSetItem(INSTALL_FIRST_LAUNCH_KEY, '1');
 }
-
-export type MobileSession = {
-  userId: string;
-  login: string;
-  nome: string;
-  perfil: string;
-  tenantId: string;
-};
 
 function isValidMobileSession(s: unknown): s is MobileSession {
   if (!s || typeof s !== 'object') return false;
@@ -88,8 +132,8 @@ export async function getStoredMobileSession(): Promise<MobileSession | null> {
 }
 
 /**
- * Login via RPC `iso_pro_autenticar_usuario` (senha não trafega em SELECT).
- * Requer migração de segurança aplicada no Supabase (`db push`).
+ * Login preferindo JWT (resolver + signIn); fallback RPC sem cutover.
+ * Requer migration `iso_pro_resolver_auth_email_sessao` actualizada (user + jwtReady).
  */
 export async function loginMobile(login: string, senha: string, tenantId?: string): Promise<MobileSession> {
   const loginTrimmed = login.trim();
@@ -110,45 +154,58 @@ export async function loginMobile(login: string, senha: string, tenantId?: strin
   await setActiveTenantId(tenant);
 
   try {
-    const rpc = await autenticarUsuarioIsoProRpc(tenant, loginTrimmed, senhaTrimmed, {
-      requiredModule: 'mobile',
-    });
+    const result = await preferJwtComTimeout(loginTrimmed, senhaTrimmed);
 
-    if (rpc.ok) {
-      const session = sessionFromRpcUser(rpc.user, tenant);
+    if (result.ok) {
+      const session = sessionFromRpcUser(result.user, tenant);
+      if (result.jwt.kind === 'mfa_required') {
+        throw new IsoProMfaRequiredError(result.jwt.factorId, session);
+      }
       await platformSetItem(SESSION_KEY, JSON.stringify(session));
       sessionCache = session;
       return session;
     }
 
-    if (rpc.rpcMissing) {
+    if (result.rpcMissing) {
       throw new Error(
         'Servidor Supabase desatualizado: falta a funcao iso_pro_autenticar_usuario. Execute «npx supabase db push» no projeto desktop e tente novamente.',
       );
     }
 
-    if (/network|fetch|timeout|failed to fetch/i.test(rpc.error)) {
-      throw new Error(
-        'Sem ligação ao Supabase (rede ou URL). Confirme internet no telemóvel, projeto Supabase ativo, e no expo.dev variáveis EXPO_PUBLIC_SUPABASE_URL e EXPO_PUBLIC_SUPABASE_ANON_KEY para o ambiente «preview» (depois gere novo build).',
-      );
+    if (/network|fetch|timeout|failed to fetch/i.test(result.error)) {
+      throw new Error(mensagemFalhaRedeSupabase());
     }
 
-    throw new Error(rpc.error || 'Login ou senha invalidos.');
+    throw new Error(result.error || 'Login ou senha invalidos.');
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    const isNet = /network request failed|failed to fetch|networkerror|aborted|timeout|typeerror.*network/i.test(
+    const isNet = /network request failed|failed to fetch|networkerror|aborted|timeout|login_timeout|typeerror.*network/i.test(
       msg.toLowerCase(),
     );
     if (isNet) {
-      throw new Error(
-        'Sem ligação ao Supabase (rede ou URL). Confirme internet no telemóvel, projeto Supabase ativo, e variáveis EXPO_PUBLIC no EAS.',
-      );
+      throw new Error(mensagemFalhaRedeSupabase());
     }
     throw e instanceof Error ? e : new Error(msg);
   }
 }
 
+export async function completeMobileLoginAfterMfa(
+  factorId: string,
+  code: string,
+  pendingSession: MobileSession,
+): Promise<MobileSession> {
+  await verifyIsoProMfaChallenge(factorId, code);
+  await platformSetItem(SESSION_KEY, JSON.stringify(pendingSession));
+  sessionCache = pendingSession;
+  return pendingSession;
+}
+
+export async function cancelMobileMfaLogin(): Promise<void> {
+  await clearIsoProJwtSession();
+}
+
 export async function logoutMobile(): Promise<void> {
+  await clearIsoProJwtSession();
   await platformDeleteItem(SESSION_KEY);
   sessionCache = null;
 }
