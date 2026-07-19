@@ -221,6 +221,9 @@ export function descricaoNaLinhaPlanejamento(it: DocumentoItemPlanejamento): str
  * mesmo cenário em que o operador vê o desenho e o saldo mas o array `materiais` está incompleto no JSON.
  *
  * Também alinha leitura **numérica do código de barras 1D** (hash) com o código alfanumérico da linha (`gerarCodigoBarras`).
+ *
+ * Boot do Atendimento carrega `recebimentos` sem `documentos[].itens` — se o código só existe nos
+ * movimentos (saldo), sintetiza a partir de recebimentos/ajustes para o scan não falhar «fora do cadastro».
  */
 export function resolverMaterialParaBaixaPorCodigo(
   payload: IsoSnapshotPayload,
@@ -258,11 +261,70 @@ export function resolverMaterialParaBaixaPorCodigo(
       };
     }
   }
+
+  const deMovimentos = sintetizarMaterialDeMovimentosOperacionais(payload, termo, linhaCasaComLeitura);
+  if (deMovimentos?.codigo) return deMovimentos;
+
   return (
     sintetizarMaterialComPendenciaParaCodigo(payload, termo) ??
     sintetizarMaterialComPendenciaParaCodigo(payload, raw) ??
     null
   );
+}
+
+/**
+ * Material a partir de recebimentos / ajustes — fontes do saldo no boot (sem linhas de desenho).
+ * Causa tipica do falso «código fora do cadastro local» com Saldo > 0 no ecrã.
+ */
+export function sintetizarMaterialDeMovimentosOperacionais(
+  payload: IsoSnapshotPayload,
+  termoLeitura: string,
+  linhaCasaComLeitura?: (codigoLinha: string) => boolean,
+): Material | null {
+  const termo = String(termoLeitura || '').trim();
+  if (!termo) return null;
+  const kWanted = codigoMaterialKey(termo);
+  if (!kWanted) return null;
+
+  const casa =
+    linhaCasaComLeitura ??
+    ((codigoLinha: string): boolean => {
+      const c = codigoLinha.trim();
+      if (!c) return false;
+      if (codigoMaterialKey(c) === kWanted) return true;
+      const hash = gerarCodigoBarras(c);
+      return Boolean(hash && hash === termo);
+    });
+
+  const codigoEmItem = (item: Record<string, unknown>): string =>
+    String(item.codigo ?? item.codigo_material ?? item.codigoMaterial ?? '').trim();
+
+  for (const recebimento of payload.recebimentos ?? []) {
+    const rec = recebimento as { status?: string; itens?: Array<Record<string, unknown>> };
+    if (String(rec.status ?? '').toLowerCase() === 'cancelado') continue;
+    for (const item of rec.itens ?? []) {
+      const c = codigoEmItem(item);
+      if (!c || !casa(c)) continue;
+      return {
+        codigo: c,
+        descricao: String(item.descricao ?? item.descricaoMaterial ?? '').trim(),
+        unidade: String(item.unidade ?? '').trim(),
+      };
+    }
+  }
+
+  for (const ajuste of payload.estoqueAjustes ?? []) {
+    const rec = ajuste as Record<string, unknown>;
+    const c = String(rec.codigo ?? rec.codigoMaterial ?? '').trim();
+    if (!c || !casa(c)) continue;
+    return {
+      codigo: c,
+      descricao: String(rec.descricao ?? rec.descricaoMaterial ?? '').trim(),
+      unidade: String(rec.unidade ?? '').trim(),
+    };
+  }
+
+  return null;
 }
 
 export interface AvaliacaoLeituraScan {

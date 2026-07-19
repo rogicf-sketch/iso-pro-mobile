@@ -152,6 +152,48 @@ describe('resolverMaterialParaBaixaPorCodigo', () => {
     };
     expect(resolverMaterialParaBaixaPorCodigo(payload, 'Y2')?.descricao).toBe('Linha Y');
   });
+
+  it('sintetiza a partir de recebimentos quando boot nao tem materiais nem docs', () => {
+    const payload: IsoSnapshotPayload = {
+      materiais: [],
+      documentos: [],
+      recebimentos: [
+        {
+          id: 'r1',
+          modoRecebimento: 'direto',
+          itens: [
+            {
+              codigo: 'EPRD10PVN4C_1_35',
+              descricao: 'Perfil',
+              unidade: 'PC',
+              quantidade: 100,
+            },
+          ],
+        },
+      ],
+    };
+    const m = resolverMaterialParaBaixaPorCodigo(payload, 'EPRD10PVN4C_1_35');
+    expect(m?.codigo).toBe('EPRD10PVN4C_1_35');
+    expect(m?.descricao).toBe('Perfil');
+    expect(avaliarLeituraScanAtendimento(payload, 'EPRD10PVN4C_1_35').encontrado).toBe(true);
+  });
+
+  it('reconhece hash 1D quando so existe o codigo no recebimento', () => {
+    const codigo = 'C9LEI004009B00-8035207';
+    const hash = gerarCodigoBarras(codigo);
+    const payload: IsoSnapshotPayload = {
+      materiais: [],
+      documentos: [],
+      recebimentos: [
+        {
+          modoRecebimento: 'direto',
+          itens: [{ codigo, descricao: 'Cabo', unidade: 'M', quantidade: 50 }],
+        },
+      ],
+    };
+    expect(resolverMaterialParaBaixaPorCodigo(payload, hash)?.codigo).toBe(codigo);
+    expect(avaliarLeituraScanAtendimento(payload, hash).encontrado).toBe(true);
+  });
 });
 
 describe('mensagemBloqueioBaixaPorCodigo', () => {

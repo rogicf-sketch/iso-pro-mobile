@@ -1677,8 +1677,8 @@ export default function AtendimentoScreen() {
       !doc &&
       pendenciaMaterialCache?.codigo === (codigoAlvoPlanejamento?.trim() ?? '') ? (
         <Text style={[styles.warn, { fontSize: 12 }]}>
-          Código ainda não reconhecido no cadastro local. Se a nuvem também não trouxe desenhos, envie o planejamento do
-          PC e toque em «Carregar dados da nuvem».
+          Código sem registo em materiais, recebimentos nem desenhos neste aparelho. Confira a etiqueta ou envie o
+          planejamento do PC e toque em «Carregar dados da nuvem».
         </Text>
       ) : null}
       <View style={styles.rowBarras}>
