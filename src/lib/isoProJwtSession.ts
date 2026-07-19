@@ -61,7 +61,32 @@ async function setJwtSessionActive(active: boolean): Promise<void> {
   } catch {
     /* ignore */
   }
-  resetSupabaseClient();
+  // Nao resetar o cliente aqui: em RN destruia a sessao em memoria e, sem
+  // AsyncStorage no createClient, o telemovel ficava authenticated/anon inconsistente
+  // (Consulta com total desenhos = 0 apesar de 1000+ na nuvem).
+}
+
+function tenantIdFromAccessToken(accessToken: string): string | null {
+  try {
+    const payloadB64 = accessToken.split('.')[1];
+    if (!payloadB64) return null;
+    const padded = payloadB64.replace(/-/g, '+').replace(/_/g, '/');
+    const padLen = (4 - (padded.length % 4)) % 4;
+    const json = globalThis.atob
+      ? globalThis.atob(padded + '='.repeat(padLen))
+      : Buffer.from(padded + '='.repeat(padLen), 'base64').toString('utf8');
+    const claims = JSON.parse(json) as {
+      tenant_id?: string;
+      app_metadata?: { tenant_id?: string };
+      user_metadata?: { tenant_id?: string };
+    };
+    const raw =
+      claims.tenant_id ?? claims.app_metadata?.tenant_id ?? claims.user_metadata?.tenant_id ?? '';
+    const t = String(raw).trim();
+    return t || null;
+  } catch {
+    return null;
+  }
 }
 
 function parseUserFromResolverBody(body: Record<string, unknown>): IsoProAuthRpcUser | null {
@@ -158,15 +183,40 @@ async function signInResolvedEmail(email: string, senha: string): Promise<JwtBoo
     return { kind: 'failed', reason: 'Supabase nao configurado.' };
   }
 
-  const { error } = await supabase.auth.signInWithPassword({
+  const { data, error } = await supabase.auth.signInWithPassword({
     email,
     password: senha.trim(),
   });
 
   if (error) {
     await setJwtSessionActive(false);
+    try {
+      await supabase.auth.signOut();
+    } catch {
+      /* ignore */
+    }
     console.warn('[I.S.O PRO mobile] JWT bootstrap falhou; modo anon mantido:', error.message);
     return { kind: 'failed', reason: error.message };
+  }
+
+  const accessToken = data.session?.access_token ?? '';
+  const jwtTenant = accessToken ? tenantIdFromAccessToken(accessToken) : null;
+  const activeTenant = getActiveTenantId();
+  if (!jwtTenant || jwtTenant !== activeTenant) {
+    console.warn(
+      '[I.S.O PRO mobile] JWT sem tenant_id alinhado; modo anon (rpc_fallback).',
+      { jwtTenant, activeTenant },
+    );
+    try {
+      await supabase.auth.signOut();
+    } catch {
+      /* ignore */
+    }
+    await setJwtSessionActive(false);
+    return {
+      kind: 'failed',
+      reason: 'JWT sem claim tenant_id (hook/membership). Continua em modo anon.',
+    };
   }
 
   const mfa = await detectMfaRequired();
@@ -223,14 +273,7 @@ export async function authenticateIsoProPreferJwt(
     return rpc;
   }
 
-  if (resolved.ok === true && resolved.jwtReady === true && 'email' in resolved) {
-    const jwt = await signInResolvedEmail(resolved.email, senha);
-    if (jwt.kind === 'ok' || jwt.kind === 'mfa_required') {
-      return { ok: true, user: rpc.user, authPath: 'jwt', jwt };
-    }
-    return { ok: true, user: rpc.user, authPath: 'rpc_fallback', jwt };
-  }
-
+  // Aqui `resolved` nunca tem jwtReady=true (esse caminho já retornou acima) — segue rpc_only.
   return { ok: true, user: rpc.user, authPath: 'rpc_only', jwt: { kind: 'skipped' } };
 }
 
@@ -270,4 +313,5 @@ export async function clearIsoProJwtSession(): Promise<void> {
     }
   }
   await setJwtSessionActive(false);
+  resetSupabaseClient();
 }

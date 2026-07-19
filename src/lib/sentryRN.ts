@@ -7,7 +7,9 @@ export function initSentryMobile(): void {
   if (inited) return;
   inited = true;
 
-  const dsn = process.env.EXPO_PUBLIC_SENTRY_DSN?.trim();
+  const dsn =
+    process.env.EXPO_PUBLIC_SENTRY_DSN?.trim() ||
+    String((Constants.expoConfig?.extra as { sentryDsn?: string } | undefined)?.sentryDsn ?? '').trim();
   if (!dsn) return;
 
   const version = Constants.expoConfig?.version ?? '0.0.0';

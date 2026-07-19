@@ -1,5 +1,29 @@
 import type { Recebimento } from 'iso-pro-shared';
 
+function chaveOrdenacaoRecebimento(r: Recebimento): string {
+  const data = String(r.data ?? r.dataCriacao ?? '').slice(0, 10);
+  const nota = String(r.nota ?? r.romaneio ?? r.fornecedorNome ?? r.id ?? '');
+  return `${data}|${nota}`.toLowerCase();
+}
+
+/**
+ * Recebimentos ainda editáveis no mobile (modo aguardando conferência + não finalizados),
+ * ordenados: em correção primeiro, depois por data/NF mais antigos.
+ */
+export function listarRecebimentosPendentesConferencia(
+  recebimentos: Recebimento[] | undefined | null,
+): Recebimento[] {
+  if (!recebimentos?.length) return [];
+  return recebimentos
+    .filter(recebimentoPermiteEditarConferencia)
+    .sort((a, b) => {
+      const parcialA = recebimentoTemConferenciaParcialGravada(a) ? 0 : 1;
+      const parcialB = recebimentoTemConferenciaParcialGravada(b) ? 0 : 1;
+      if (parcialA !== parcialB) return parcialA - parcialB;
+      return chaveOrdenacaoRecebimento(a).localeCompare(chaveOrdenacaoRecebimento(b));
+    });
+}
+
 /**
  * Só nestes recebimentos o mobile deve usar vermelho para linhas com divergência
  * (evita «pendência» falsa em recebimento direto ou já conferido).

@@ -1,4 +1,5 @@
 import { hasSupabaseConfig, getSupabaseHostHintForUser } from './config';
+import { captureOperationalEvent } from './errorReporting';
 import {
   authenticateIsoProPreferJwt,
   clearIsoProJwtSession,
@@ -159,8 +160,10 @@ export async function loginMobile(login: string, senha: string, tenantId?: strin
     if (result.ok) {
       const session = sessionFromRpcUser(result.user, tenant);
       if (result.jwt.kind === 'mfa_required') {
+        captureOperationalEvent('mfa_challenge', { login: loginTrimmed, authPath: result.authPath, client: 'mobile' }, 'info');
         throw new IsoProMfaRequiredError(result.jwt.factorId, session);
       }
+      captureOperationalEvent('auth_path', { login: loginTrimmed, path: result.authPath, client: 'mobile' }, 'info');
       await platformSetItem(SESSION_KEY, JSON.stringify(session));
       sessionCache = session;
       return session;
@@ -195,6 +198,11 @@ export async function completeMobileLoginAfterMfa(
   pendingSession: MobileSession,
 ): Promise<MobileSession> {
   await verifyIsoProMfaChallenge(factorId, code);
+  captureOperationalEvent(
+    'auth_path',
+    { login: pendingSession.login, path: 'jwt', client: 'mobile', mfa: true },
+    'info',
+  );
   await platformSetItem(SESSION_KEY, JSON.stringify(pendingSession));
   sessionCache = pendingSession;
   return pendingSession;

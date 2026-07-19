@@ -57,7 +57,7 @@ Depois de alterar `iso-pro-shared` na pasta mestre, atualize o vendor antes de c
 
 ## Release para obra (APK / EAS)
 
-Antes de distribuir build a campo (**versão atual: 1.0.22**, `android.versionCode` **23** em `app.config.ts`):
+Antes de distribuir build a campo (**versão atual: 1.0.25**, `android.versionCode` **26** em `app.config.ts`):
 
 1. `npm run ci` nesta pasta.
 2. Seguir o checklist manual: [`docs/checklist-release-campo.md`](docs/checklist-release-campo.md) (sync, conferência com destravar, atendimento, recibos — ~15–20 min com telemóvel + PC na mesma nuvem).
@@ -69,17 +69,23 @@ Fluxos em [Maestro](https://maestro.mobile.dev/) na pasta **`.maestro/`** — ve
 
 ## SQL necessário no Supabase
 
-Use as **migrações** do repositório **`iso-pro-desktop`** em `supabase/migrations/`, por ordem de nome:
+Use as **migrações** do repositório **`iso-pro-desktop`** em `supabase/migrations/`, por ordem de nome (lista completa no README do desktop). Mínimo obrigatório:
 
 1. `20260205120000_iso_pro_multi_tenant.sql`
 2. `20260207130000_iso_pro_auth_membership_auto_sync.sql`
 3. `20260208120000_perfis_acesso_codigo_unique_per_tenant.sql`
 4. `20260503120000_iso_pro_usuarios_colaborador_id.sql`
 5. `20260503120100_iso_pro_usuario_admin_rpcs.sql`
+6. `20260529120000_iso_pro_password_hash.sql` (login com hash)
+7. Migrações `20260604*` (RLS, pgcrypto, PDF jobs, auth hook prep) — ver `iso-pro-desktop/supabase/migrations/`
 
-A migração multi-tenant inclui tabelas de snapshot, dispositivos mobile e cadastros partilhados com o desktop. Com isso, o módulo **Dispositivos Mobile** no desktop consegue listar, autorizar, bloquear e revogar aparelhos; o app campo persiste vínculo em `dispositivos_mobile` e logs em `mobile_logs_acesso`.
+## Campo vs PC (escopo)
 
-Sem essas migrações, o app mobile continua em modo local, mas vínculo, bloqueio e autorização remotos não ficam persistidos no Supabase.
+- **Mobile:** retiradas, conferência NF, inventário, consulta documentos — offline-first com fila de sync.
+- **PC/Web:** estorno de material, RIR, RNC, etiquetas, equipamentos, export Excel auditável.
+- Estorno **não existe** no app Campo (deliberado — segurança e recibo auditável no escritório).
+
+Sem as migrações, o app continua em modo local, mas vínculo, bloqueio e autorização remotos não ficam persistidos no Supabase.
 
 ## Abrir no Cursor / VS Code
 

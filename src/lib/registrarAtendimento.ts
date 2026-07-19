@@ -1,10 +1,31 @@
+/**
+ * Registo de atendimentos (retiradas) no app Campo — offline-first com fila de sync.
+ * Estorno/devolucao ao estoque e recibo de estorno sao deliberadamente apenas PC/web (seguranca).
+ */
 import type {
+  AtendimentoLote,
   DocumentoItemPlanejamento,
   DocumentoPlanejamento,
   IsoSnapshotPayload,
   Material,
 } from 'iso-pro-shared';
+import { formatNumeroAtendimento, reservarProximoNumeroAtendimento } from 'iso-pro-shared';
 import { buildSaldoOperacionalParaAtendimento, codigoMaterialKey } from './saldoMaterial';
+import {
+  cssReciboAtendimentoLayout,
+  escapeHtmlRecibo,
+  htmlAssinaturasRecibo,
+  htmlLinhaItemRecibo,
+  htmlLogoRecibo,
+  linhaMatriculaFuncaoAssinatura,
+  nomeExibicaoAtendenteAssinatura,
+  segmentoRodapeInstituicaoRecibo,
+} from './reciboAtendimentoLayout';
+import {
+  DOCUMENTO_RODAPE_CNPJ_PADRAO,
+  DOCUMENTO_RODAPE_NOME_PADRAO,
+  resolverUrlLogoReciboMobile,
+} from './logoInstitucionalRecibo';
 
 function linhaPlanejamentoMesmoCodigo(codigoItem: unknown, codigoBuscado: string): boolean {
   return codigoMaterialKey(String(codigoItem ?? '')) === codigoMaterialKey(codigoBuscado);
@@ -34,11 +55,20 @@ function slugPlanejamento(s: string, max: number): string {
  * Garante `id` em cada desenho e em cada linha antes de gravar na nuvem.
  * Desenhos sem id quebram o cruzamento desktop/mobile no snapshot; linhas sem id impedem reconciliação por item.
  */
+function documentoPlanejamentoTemIdsCompletos(doc: DocumentoPlanejamento): boolean {
+  if (doc.id == null || String(doc.id).trim() === '') return false;
+  for (const item of doc.itens ?? []) {
+    const row = item as DocumentoItemPlanejamento & { id?: string | number };
+    if (row.id == null || String(row.id).trim() === '') return false;
+  }
+  return true;
+}
+
 export function garantirIdsDocumentosPlanejamento(payload: IsoSnapshotPayload): void {
   const docs = (payload.documentos ?? []) as DocumentoPlanejamento[];
   for (let i = 0; i < docs.length; i++) {
     const d = docs[i];
-    if (!d) continue;
+    if (!d || documentoPlanejamentoTemIdsCompletos(d)) continue;
     const temId = d.id != null && String(d.id).trim() !== '';
     if (!temId) {
       const num = slugPlanejamento(String(d.numero ?? ''), 56);
@@ -56,6 +86,50 @@ export function garantirIdsDocumentosPlanejamento(payload: IsoSnapshotPayload): 
     }
   }
   payload.documentos = docs;
+}
+
+/** Resolve id estável do desenho no snapshot (numero + revisão) — obrigatório para baixa por código. */
+export function resolverIdDocumentoPlanejamento(
+  payload: IsoSnapshotPayload,
+  doc: Pick<DocumentoPlanejamento, 'id' | 'numero' | 'revisao'> | null | undefined,
+): string | null {
+  if (!doc) return null;
+  const idDireto = doc.id != null ? String(doc.id).trim() : '';
+  if (idDireto) return idDireto;
+
+  const numero = String(doc.numero ?? '').trim();
+  if (!numero) return null;
+  const revisao = String(doc.revisao ?? '').trim();
+
+  const docs = (payload.documentos ?? []) as DocumentoPlanejamento[];
+  const candidatos = docs.filter((d) => String(d.numero ?? '').trim() === numero);
+  if (!candidatos.length) return null;
+  if (revisao) {
+    const exato = candidatos.find((d) => String(d.revisao ?? '').trim() === revisao);
+    if (exato?.id != null && String(exato.id).trim()) return String(exato.id);
+  }
+  const comId = candidatos.find((d) => d.id != null && String(d.id).trim());
+  return comId?.id != null ? String(comId.id) : null;
+}
+
+export function materialTemDemandaPendenteNoDocumento(
+  payload: IsoSnapshotPayload,
+  documentoId: string,
+  codigoMaterial: string,
+): boolean {
+  const cod = codigoMaterialKey(String(codigoMaterial ?? ''));
+  if (!cod) return false;
+  const doc = ((payload.documentos ?? []) as DocumentoPlanejamento[]).find(
+    (d) => String(d.id ?? '') === String(documentoId),
+  );
+  if (!doc) return false;
+  for (const it of doc.itens ?? []) {
+    if (codigoMaterialKey(codigoNaLinhaPlanejamento(it as DocumentoItemPlanejamento)) !== cod) continue;
+    const qProj = Number(it.quantidade) || 0;
+    const qAt = quantidadeAtendidaLinha(it as DocumentoItemPlanejamento);
+    if (qProj - qAt > 1e-9) return true;
+  }
+  return false;
 }
 
 /** Igual a `gerarCodigoBarras` no I.S.O PRO (HTML) — etiquetas / leitura. */
@@ -201,7 +275,7 @@ export function listarDocumentosComDemandaPendenteMaterial(
       const qAt = quantidadeAtendidaLinha(it as DocumentoItemPlanejamento);
       rest += Math.max(0, qProj - qAt);
     }
-    if (rest > 0) {
+    if (rest > 1e-9) {
       out.push({ documento: d, restanteMaterial: rest });
     }
   }
@@ -288,10 +362,22 @@ export function aplicarAtendimentoPorCodigoBarras(
   continuacao?: { loteNumero: string; loteId: number } | null,
   opcoes?: {
     apenasDocumentoId?: string | number | null;
+    /** Mobile: baixa por código exige desenho de referência válido (nunca reparte silenciosamente em todos os desenhos). */
+    exigirDocumentoReferencia?: boolean;
     identificacaoComplementar?: IdentificacaoComplementarAtendimentoHistorico;
+    /** Numero reservado na nuvem (atomico) antes da primeira baixa da sessao. */
+    reservaInicial?: { loteNumero: string; loteId: number } | null;
   },
 ):
-  | { ok: true; payload: IsoSnapshotPayload; loteNumero: string; loteId: number; atendidoTotal: number; material: Material }
+  | {
+      ok: true;
+      payload: IsoSnapshotPayload;
+      loteNumero: string;
+      loteId: number;
+      atendidoTotal: number;
+      material: Material;
+      documentosGravados: string[];
+    }
   | { ok: false; erro: string } {
   const material = resolverMaterialParaBaixaPorCodigo(payload, codigoLido);
   if (!material || !material.codigo) {
@@ -308,13 +394,28 @@ export function aplicarAtendimentoPorCodigoBarras(
 
   const restritoId =
     opcoes?.apenasDocumentoId != null && String(opcoes.apenasDocumentoId).trim() !== ''
-      ? String(opcoes.apenasDocumentoId)
+      ? String(opcoes.apenasDocumentoId).trim()
       : null;
 
-  const docsOrig = (payload.documentos || []) as DocumentoPlanejamento[];
+  if (opcoes?.exigirDocumentoReferencia && !restritoId) {
+    return {
+      ok: false,
+      erro:
+        'Documento de referência inválido ou sem identificador no planejamento. Busque o desenho novamente antes de dar baixa.',
+    };
+  }
+
+  if (restritoId && !materialTemDemandaPendenteNoDocumento(payload, restritoId, String(material.codigo ?? ''))) {
+    return {
+      ok: false,
+      erro: `O material ${String(material.codigo ?? codigoLido)} não possui pendência no desenho de referência aberto. Abra o desenho correto ou escolha outro item.`,
+    };
+  }
+
+  const docsValidacao = (payload.documentos || []) as DocumentoPlanejamento[];
   const docsParaFifo = restritoId
-    ? docsOrig.filter((d) => String(d.id ?? '') === restritoId)
-    : docsOrig;
+    ? docsValidacao.filter((d) => String(d.id ?? '') === restritoId)
+    : docsValidacao;
 
   if (restritoId && docsParaFifo.length === 0) {
     return { ok: false, erro: 'Documento de referência não encontrado no planejamento.' };
@@ -369,16 +470,26 @@ export function aplicarAtendimentoPorCodigoBarras(
     };
   }
 
-  const next = deepClone(payload);
+  const next: IsoSnapshotPayload = { ...payload };
   garantirIdsDocumentosPlanejamento(next);
-  const docs = (next.documentos || []) as DocumentoPlanejamento[];
-  for (let d = 0; d < docs.length; d++) {
-    docs[d] = deepClone(docs[d]);
-    docs[d].itens = Array.isArray(docs[d].itens) ? docs[d].itens!.map((it) => ({ ...it })) : [];
-  }
+  const docsOrig = (next.documentos || []) as DocumentoPlanejamento[];
+  const docs = [...docsOrig];
+
+  /** Só clona o desenho que vai ser alterado (evita O(n) desenhos × itens em cada baixa por código). */
+  const cloneDocById = (docId: string): DocumentoPlanejamento | null => {
+    const idx = docs.findIndex((d) => String(d.id ?? '') === docId);
+    if (idx === -1) return null;
+    if (docs[idx] === docsOrig[idx]) {
+      const src = docs[idx]!;
+      docs[idx] = {
+        ...src,
+        itens: Array.isArray(src.itens) ? src.itens.map((it) => ({ ...it })) : [],
+      };
+    }
+    return docs[idx]!;
+  };
 
   next.configuracoesSistema = { ...(next.configuracoesSistema || {}) };
-  const cfg = next.configuracoesSistema as Record<string, unknown>;
 
   const usarContinuacao =
     continuacao &&
@@ -392,18 +503,25 @@ export function aplicarAtendimentoPorCodigoBarras(
     loteNumero = String(continuacao!.loteNumero).trim();
     loteId = continuacao!.loteId;
   } else {
-    loteNumero = gerarNumeroAtendimento(cfg);
-    loteId = Date.now() + Math.floor(Math.random() * 1000);
+    const alocado = alocarNovoLote(next, opcoes?.reservaInicial);
+    loteNumero = alocado.loteNumero;
+    loteId = alocado.loteId;
   }
 
-  let hid = nextHistoricoId((next.atendimentoHistorico || []) as { id?: number }[]);
+  const historicoBase = [...((next.atendimentoHistorico || []) as Record<string, unknown>[])];
+  const novasLinhasHistorico: Record<string, unknown>[] = [];
+  let hid = nextHistoricoId(historicoBase as { id?: number }[]);
   let restante = quantidade;
   let atendidoTotal = 0;
+  const documentosGravados = new Set<string>();
 
-  const docsAplicar = restritoId ? docs.filter((d) => String(d.id ?? '') === restritoId) : docs;
+  const docsAplicar = restritoId ? docsOrig.filter((d) => String(d.id ?? '') === restritoId) : docsOrig;
 
   for (let d = 0; d < docsAplicar.length && restante > 0; d++) {
-    const doc = docsAplicar[d];
+    const docRef = docsAplicar[d]!;
+    const docId = String(docRef.id ?? '');
+    const doc = cloneDocById(docId);
+    if (!doc) continue;
     const itens = doc.itens || [];
     for (let ii = 0; ii < itens.length && restante > 0; ii++) {
       const item = itens[ii] as DocumentoItemPlanejamento;
@@ -415,28 +533,26 @@ export function aplicarAtendimentoPorCodigoBarras(
       if (pendente <= 0) continue;
       const qtdAplicar = Math.min(restante, pendente);
       item.quantidadeAtendida = qAt + qtdAplicar;
+      documentosGravados.add(String(doc.numero ?? '-'));
       hid += 1;
-      next.atendimentoHistorico = [
-        ...(next.atendimentoHistorico || []),
-        {
-          id: hid,
-          loteId,
-          loteNumero,
-          data: new Date().toISOString(),
-          documento: doc.numero || '-',
-          documentoId: doc.id ?? null,
-          documentoItemId: (item as { id?: string | number }).id ?? null,
-          codigo: cLinha,
-          descricao: descricaoNaLinhaPlanejamento(item),
-          quantidade: qtdAplicar,
-          unidade: item.unidade,
-          atendente,
-          matricula,
-          recebedor: receb,
-          origem: 'mobile',
-          ...extraIdent,
-        },
-      ];
+      novasLinhasHistorico.push({
+        id: hid,
+        loteId,
+        loteNumero,
+        data: new Date().toISOString(),
+        documento: doc.numero || '-',
+        documentoId: doc.id ?? null,
+        documentoItemId: (item as { id?: string | number }).id ?? null,
+        codigo: cLinha,
+        descricao: descricaoNaLinhaPlanejamento(item),
+        quantidade: qtdAplicar,
+        unidade: item.unidade,
+        atendente,
+        matricula,
+        recebedor: receb,
+        origem: 'mobile',
+        ...extraIdent,
+      });
       restante -= qtdAplicar;
       atendidoTotal += qtdAplicar;
     }
@@ -450,9 +566,11 @@ export function aplicarAtendimentoPorCodigoBarras(
     };
   }
 
+  next.atendimentoHistorico = [...historicoBase, ...novasLinhasHistorico];
+
   if (!usarContinuacao) {
     next.atendimentoLotes = [
-      ...(next.atendimentoLotes || []),
+      ...((next.atendimentoLotes || []) as AtendimentoLote[]),
       {
         id: loteId,
         numero: loteNumero,
@@ -469,7 +587,15 @@ export function aplicarAtendimentoPorCodigoBarras(
 
   next.documentos = docs;
   next.dataAtualizacao = new Date().toISOString();
-  return { ok: true, payload: next, loteNumero, loteId, atendidoTotal, material };
+  return {
+    ok: true,
+    payload: next,
+    loteNumero,
+    loteId,
+    atendidoTotal,
+    material,
+    documentosGravados: Array.from(documentosGravados),
+  };
 }
 
 export function montarTextoReciboCodigoBarras(
@@ -513,6 +639,8 @@ export type LinhaSessaoAtendimento =
         descricao: string;
         responsavel?: string;
       } | null;
+      /** Desenhos onde a baixa foi gravada no planejamento (pode diferir do ref. se corrigido). */
+      documentosGravados?: string[];
     }
   | {
       tipo: 'documento';
@@ -552,13 +680,207 @@ function textoCampoReciboOpcional(v: string | undefined | null): string {
 
 /** Matrícula + função numa linha (recibo assinaturas / identificação). */
 function linhaMatriculaFuncaoReciboCompacta(matExibicao: string, funcaoExibicao: string): string {
-  const mOk = Boolean(matExibicao && matExibicao !== '—');
-  const fOk = Boolean(funcaoExibicao && funcaoExibicao !== '—');
-  if (!mOk && !fOk) return '—';
-  const p: string[] = [];
-  if (mOk) p.push(`Mat. ${matExibicao}`);
-  if (fOk) p.push(funcaoExibicao);
-  return p.join(' · ');
+  return linhaMatriculaFuncaoAssinatura(matExibicao, funcaoExibicao);
+}
+
+function lotesNaSessao(linhas: LinhaSessaoAtendimento[]): string[] {
+  const s = new Set<string>();
+  for (const L of linhas) {
+    const n = String(L.loteNumero ?? '').trim();
+    if (n) s.add(n);
+  }
+  return [...s];
+}
+
+function documentosUnicosNaSessao(linhas: LinhaSessaoAtendimento[]): string[] {
+  const s = new Set<string>();
+  for (const L of linhas) {
+    if (L.tipo === 'documento') {
+      const n = String(L.docNumero ?? '').trim();
+      if (n) s.add(n);
+      continue;
+    }
+    for (const d of L.documentosGravados ?? []) {
+      const n = String(d ?? '').trim();
+      if (n && n !== '-') s.add(n);
+    }
+    const ref = L.documentoPlanejamento?.numero?.trim();
+    if (ref) s.add(ref);
+  }
+  return Array.from(s);
+}
+
+function documentoExibicaoLinhaSessao(row: LinhaSessaoAtendimento): string {
+  if (row.tipo === 'documento') return String(row.docNumero ?? '—');
+  const gravados = (row.documentosGravados ?? []).map((d) => String(d).trim()).filter(Boolean);
+  if (gravados.length === 1) return gravados[0]!;
+  if (gravados.length > 1) return gravados.join(' · ');
+  return String(row.documentoPlanejamento?.numero ?? '—');
+}
+
+function chaveDesenhoLinhaCodigoBarras(
+  row: Extract<LinhaSessaoAtendimento, { tipo: 'codigo_barras' }>,
+): string {
+  const gravado = (row.documentosGravados ?? []).map((d) => String(d).trim()).find(Boolean);
+  if (gravado) return gravado;
+  return String(row.documentoPlanejamento?.numero ?? '').trim() || '__sem_desenho__';
+}
+
+/** Lotes distintos presentes na sessão (para reconstruir recibo a partir do histórico). */
+export function lotesDistintosNaSessaoAtendimento(
+  linhas: LinhaSessaoAtendimento[],
+  loteRef?: { loteNumero: string; loteId: number } | null,
+): { loteId: number; loteNumero: string }[] {
+  if (loteRef?.loteNumero && typeof loteRef.loteId === 'number') {
+    return [loteRef];
+  }
+  const nums = [...new Set(linhas.map((l) => String(l.loteNumero ?? '').trim()).filter(Boolean))];
+  return nums.map((loteNumero) => ({ loteId: NaN, loteNumero }));
+}
+
+/** Recibo fiel ao que foi gravado — reconstrói linhas a partir de `atendimentoHistorico`. */
+export function reconstruirLinhasReciboSessaoDoHistorico(
+  payload: IsoSnapshotPayload,
+  lotes: { loteId: number; loteNumero: string }[],
+): LinhaSessaoAtendimento[] {
+  if (!lotes.length) return [];
+  const historico = (payload.atendimentoHistorico ?? []) as Record<string, unknown>[];
+  const docs = (payload.documentos ?? []) as DocumentoPlanejamento[];
+  const out: LinhaSessaoAtendimento[] = [];
+
+  for (const lote of lotes) {
+    const num = String(lote.loteNumero ?? '').trim();
+    const linhasHist = historico
+      .filter((h) => h.loteId === lote.loteId && String(h.loteNumero ?? '').trim() === num)
+      .sort((a, b) => Number(a.id ?? 0) - Number(b.id ?? 0));
+
+    for (const h of linhasHist) {
+      const codigo = String(h.codigo ?? '').trim();
+      const mat =
+        (codigo ? resolverMaterialParaBaixaPorCodigo(payload, codigo) : null) ??
+        ({
+          codigo: codigo || '—',
+          descricao: String(h.descricao ?? ''),
+          unidade: String(h.unidade ?? 'UN'),
+        } as Material);
+      const docId = h.documentoId != null ? String(h.documentoId) : '';
+      const docNum = String(h.documento ?? '').trim();
+      const doc =
+        docs.find((d) => docId && String(d.id ?? '') === docId) ??
+        (docNum ? docs.find((d) => String(d.numero ?? '').trim() === docNum) : undefined);
+
+      out.push({
+        tipo: 'codigo_barras',
+        loteNumero: num,
+        material: mat,
+        atendidoTotal: Number(h.quantidade) || 0,
+        documentoPlanejamento: doc
+          ? {
+              numero: String(doc.numero ?? docNum),
+              revisao: String(doc.revisao ?? ''),
+              descricao: String(doc.descricao ?? ''),
+              responsavel: String(doc.responsavel ?? '').trim() || undefined,
+            }
+          : docNum
+            ? { numero: docNum, revisao: '', descricao: '', responsavel: undefined }
+            : null,
+        documentosGravados: docNum ? [docNum] : [],
+      });
+    }
+  }
+  return out;
+}
+
+/** Preferir histórico (fonte de verdade) quando a sessão em memória perdeu linhas. */
+export function linhasReciboSessaoComFallbackHistorico(
+  payload: IsoSnapshotPayload,
+  linhasSessao: LinhaSessaoAtendimento[],
+  loteRef?: { loteNumero: string; loteId: number } | null,
+): LinhaSessaoAtendimento[] {
+  if (!linhasSessao.length) return linhasSessao;
+  const lotes = lotesDistintosNaSessaoAtendimento(linhasSessao, loteRef);
+  if (!lotes.length) return linhasSessao;
+  const historico = (payload.atendimentoHistorico ?? []) as Record<string, unknown>[];
+  const lotesResolvidos = lotes.map((l) => {
+    if (Number.isFinite(l.loteId)) return l;
+    const rows = historico.filter((h) => String(h.loteNumero ?? '').trim() === l.loteNumero);
+    const ids = [...new Set(rows.map((h) => h.loteId).filter((id): id is number => typeof id === 'number'))];
+    if (ids.length === 1) return { loteNumero: l.loteNumero, loteId: ids[0]! };
+    return l;
+  }).filter((l) => Number.isFinite(l.loteId));
+  if (!lotesResolvidos.length) return linhasSessao;
+  const doHistorico = reconstruirLinhasReciboSessaoDoHistorico(payload, lotesResolvidos);
+  if (doHistorico.length > 0) return doHistorico;
+  return linhasSessao;
+}
+
+function montarHtmlTabelaItensReciboSessao(linhas: LinhaSessaoAtendimento[]): {
+  html: string;
+  totalUnidades: number;
+  qtdItens: number;
+} {
+  const mostrarColDoc = documentosUnicosNaSessao(linhas).length > 1;
+  const rows: string[] = [];
+  let idx = 0;
+  let total = 0;
+  let i = 0;
+
+  while (i < linhas.length) {
+    const row = linhas[i]!;
+    if (row.tipo === 'documento') {
+      for (const it of row.itens) {
+        rows.push(
+          htmlLinhaItemRecibo(
+            idx,
+            it.codigo,
+            it.descricao,
+            it.unidade,
+            Number(it.qtd) || 0,
+            mostrarColDoc ? row.docNumero : undefined,
+          ),
+        );
+        idx += 1;
+        total += Number(it.qtd) || 0;
+      }
+      i += 1;
+      continue;
+    }
+    const proto = row.loteNumero;
+    while (i < linhas.length && linhas[i]!.tipo === 'codigo_barras' && linhas[i]!.loteNumero === proto) {
+      const x = linhas[i] as Extract<LinhaSessaoAtendimento, { tipo: 'codigo_barras' }>;
+      rows.push(
+        htmlLinhaItemRecibo(
+          idx,
+          String(x.material.codigo ?? '—'),
+          String(x.material.descricao ?? '—'),
+          String(x.material.unidade ?? 'UN'),
+          Number(x.atendidoTotal) || 0,
+          mostrarColDoc ? documentoExibicaoLinhaSessao(x) : undefined,
+        ),
+      );
+      idx += 1;
+      total += Number(x.atendidoTotal) || 0;
+      i += 1;
+    }
+  }
+
+  const thDoc = mostrarColDoc ? '<th class="col-doc">Documento</th>' : '';
+
+  const html =
+    '<div class="recibo-tabela-wrap">' +
+    '<table class="recibo-tabela-itens">' +
+    '<thead><tr>' +
+    '<th class="col-num">#</th>' +
+    thDoc +
+    '<th class="col-codigo">Codigo</th>' +
+    '<th class="col-desc">Descricao do material</th>' +
+    '<th class="col-un">UN</th>' +
+    '<th class="col-qtd">Qtd</th>' +
+    '</tr></thead><tbody>' +
+    rows.join('') +
+    '</tbody></table></div>';
+
+  return { html, totalUnidades: total, qtdItens: idx };
 }
 
 /** Gravado em `atendimentoHistorico` / `atendimentoLotes` para o PC exibir matrícula e função no recibo. */
@@ -634,18 +956,43 @@ function ultimoLoteNumeroSessao(linhas: LinhaSessaoAtendimento[]): string {
   return last || '—';
 }
 
-/** Quando a sessão tem um único protocolo, o cabeçalho já mostra o ATD — evita repetir nos blocos de itens. */
-function loteUnicoNaSessao(linhas: LinhaSessaoAtendimento[]): string | null {
-  const s = new Set<string>();
-  for (const L of linhas) {
-    const n = String(L.loteNumero ?? '').trim();
-    if (n) s.add(n);
-  }
-  if (s.size === 1) return [...s][0]!;
-  return null;
+/** Formata quantidade + unidade para partilha (WhatsApp reconhece *negrito*). */
+function linhaQtdUnReciboCompartilhavel(qtd: number, unidade: string): string {
+  const q = Number(qtd) || 0;
+  const un = String(unidade ?? 'UN').trim() || 'UN';
+  return `*${q.toLocaleString('pt-BR')} ${un}*`;
 }
 
-const REC_SEP = '────────────────────────────────────────────────────────';
+function tituloDocumentoReciboCompartilhavel(numero: string, revisao?: string): string {
+  const num = String(numero ?? '').trim() || '—';
+  const rev = String(revisao ?? '').trim();
+  return rev ? `${num} Rev. ${rev}` : num;
+}
+
+function linhasItemReciboCompartilhavel(
+  indice: number,
+  codigo: string,
+  qtd: number,
+  unidade: string,
+  descricao: string,
+): string[] {
+  const cod = String(codigo ?? '—').replace(/\|/g, '/').trim() || '—';
+  const desc0 = String(descricao ?? '—').replace(/\s+/g, ' ').trim() || '—';
+  return [
+    `*${indice}.* ${cod} · ${linhaQtdUnReciboCompartilhavel(qtd, unidade)}`,
+    ...quebrarTextoParaRecibo(desc0, REC_WRAP - 2, '   '),
+  ];
+}
+
+function linhasListaDocumentosProtocolo(docs: string[]): string[] {
+  if (docs.length <= 1) return [];
+  const out: string[] = [`*Documentos no protocolo (${docs.length}):*`];
+  docs.forEach((d, i) => {
+    out.push(`${i + 1}. ${d}`);
+  });
+  out.push('');
+  return out;
+}
 
 function docRefCabecalhoTemConteudo(
   d: Pick<DocumentoPlanejamento, 'numero' | 'revisao' | 'descricao' | 'responsavel'> | null | undefined,
@@ -687,33 +1034,24 @@ function documentoReferenciaAPartirDasLinhas(
 }
 
 /**
- * Itens em blocos (sem truncar código/descrição): aproxima o detalhe do comprovante do PC.
+ * Itens agrupados por desenho — legível no WhatsApp (sem tabela ASCII / pipes).
  */
 function montarLinhasTabelaReciboPc(linhas: LinhaSessaoAtendimento[]): { rows: string[]; totalUnidades: number } {
   const rows: string[] = [];
   let idx = 0;
   let total = 0;
   let i = 0;
-  const W = REC_WRAP - 4;
 
   while (i < linhas.length) {
     const row = linhas[i]!;
     if (row.tipo === 'documento') {
       rows.push('');
-      rows.push('  ▸ Documento (agrupamento por desenho):');
-      const docTitulo = `${String(row.docNumero ?? '').trim()}  Rev. ${String(row.docRevisao ?? '').trim()}`.trim();
-      rows.push(...quebrarTextoParaRecibo(docTitulo, W, '     '));
-      rows.push(`     Lote / protocolo: ${row.loteNumero}`);
-      rows.push(`     #  | UN | Qtd | Código | Descrição`);
+      rows.push(`*${tituloDocumentoReciboCompartilhavel(row.docNumero, row.docRevisao)}*`);
       for (const it of row.itens) {
         idx += 1;
         const q = Number(it.qtd) || 0;
         total += q;
-        const un = String(it.unidade ?? 'UN');
-        const cod = String(it.codigo ?? '—').replace(/\|/g, '/');
-        const desc0 = String(it.descricao ?? '—').replace(/\s+/g, ' ').trim();
-        rows.push(`     ${String(idx).padStart(2)} | ${un.padEnd(4)} | ${String(q).padStart(5)} | ${cod}`);
-        rows.push(...quebrarTextoParaRecibo(desc0, W - 5, '         '));
+        rows.push(...linhasItemReciboCompartilhavel(idx, it.codigo, q, it.unidade, it.descricao));
       }
       i += 1;
       continue;
@@ -724,35 +1062,40 @@ function montarLinhasTabelaReciboPc(linhas: LinhaSessaoAtendimento[]): { rows: s
       run.push(linhas[i]!);
       i += 1;
     }
-    const primeiroComDoc = run.find(
-      (r): r is Extract<LinhaSessaoAtendimento, { tipo: 'codigo_barras' }> =>
-        r.tipo === 'codigo_barras' && Boolean(r.documentoPlanejamento?.numero?.trim()),
-    );
-    rows.push('');
-    if (primeiroComDoc?.documentoPlanejamento) {
-      const dp = primeiroComDoc.documentoPlanejamento;
-      rows.push('  ▸ Documento no planejamento (referência):');
-      const refLinha = `${String(dp.numero).trim()}  Rev. ${String(dp.revisao ?? '').trim()}`;
-      rows.push(...quebrarTextoParaRecibo(refLinha, W, '     '));
-      if (String(dp.responsavel ?? '').trim()) {
-        rows.push(`     Responsável: ${String(dp.responsavel).trim()}`);
-      }
-      if (String(dp.descricao ?? '').trim()) {
-        rows.push(...quebrarTextoParaRecibo(`Descrição: ${String(dp.descricao)}`, W, '     '));
-      }
-    }
-    rows.push(`  ▸ Lote / protocolo: ${proto} (baixa por código)`);
-    rows.push(`     #  | UN | Qtd | Código | Descrição`);
+    const porDesenho = new Map<string, Extract<LinhaSessaoAtendimento, { tipo: 'codigo_barras' }>[]>();
     for (const r of run) {
-      const x = r as Extract<LinhaSessaoAtendimento, { tipo: 'codigo_barras' }>;
-      idx += 1;
-      const q = Number(x.atendidoTotal) || 0;
-      total += q;
-      const un = String(x.material.unidade ?? 'UN');
-      const cod = String(x.material.codigo ?? '—').replace(/\|/g, '/');
-      const desc0 = String(x.material.descricao ?? '—').replace(/\s+/g, ' ').trim();
-      rows.push(`     ${String(idx).padStart(2)} | ${un.padEnd(4)} | ${String(q).padStart(5)} | ${cod}`);
-      rows.push(...quebrarTextoParaRecibo(desc0, W - 5, '         '));
+      if (r.tipo !== 'codigo_barras') continue;
+      const k = chaveDesenhoLinhaCodigoBarras(r);
+      const arr = porDesenho.get(k) ?? [];
+      arr.push(r);
+      porDesenho.set(k, arr);
+    }
+    for (const grupo of porDesenho.values()) {
+      const primeiroComDoc = grupo.find((r) => Boolean(r.documentoPlanejamento?.numero?.trim()));
+      rows.push('');
+      if (primeiroComDoc?.documentoPlanejamento) {
+        const dp = primeiroComDoc.documentoPlanejamento;
+        rows.push(`*${tituloDocumentoReciboCompartilhavel(dp.numero, dp.revisao)}*`);
+        if (String(dp.responsavel ?? '').trim()) {
+          rows.push(`   Responsável: ${String(dp.responsavel).trim()}`);
+        }
+      } else {
+        rows.push(`*Baixa por código · ${proto}*`);
+      }
+      for (const x of grupo) {
+        idx += 1;
+        const q = Number(x.atendidoTotal) || 0;
+        total += q;
+        rows.push(
+          ...linhasItemReciboCompartilhavel(
+            idx,
+            String(x.material.codigo ?? '—'),
+            q,
+            String(x.material.unidade ?? 'UN'),
+            String(x.material.descricao ?? '—'),
+          ),
+        );
+      }
     }
   }
   return { rows, totalUnidades: total };
@@ -789,9 +1132,12 @@ export function montarTextoReciboSessaoUnificada(
   if (linhas.length === 0) return '';
   const cfg = contexto?.configuracoesSistema;
   const docRef =
-    docRefCabecalhoTemConteudo(contexto?.documentoReferencia ?? undefined) ?
-      contexto?.documentoReferencia ?? null
-    : documentoReferenciaAPartirDasLinhas(linhas);
+    documentosUnicosNaSessao(linhas).length === 1
+      ? documentoReferenciaAPartirDasLinhas(linhas) ??
+        (docRefCabecalhoTemConteudo(contexto?.documentoReferencia ?? undefined)
+          ? contexto?.documentoReferencia ?? null
+          : null)
+      : null;
   const geradoEm = new Date().toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' });
   const idAs = contexto?.identificacaoAssinaturas;
   const matBrutaAt = (matriculaAtendente ?? '').trim();
@@ -808,245 +1154,62 @@ export function montarTextoReciboSessaoUnificada(
 
   const refLote = ultimoLoteNumeroSessao(linhas);
   const { rows: linhasTab, totalUnidades } = montarLinhasTabelaReciboPc(linhas);
+  const docsProtocolo = documentosUnicosNaSessao(linhas);
 
   const out: string[] = [
-    REC_SEP,
-    'I.S.O PRO — Recibo de retirada de material (sessão — app móvel)',
-    REC_SEP,
-    `Gerado em: ${geradoEm}    ·    Ref. lote: ${refLote}`,
+    '*I.S.O PRO — Recibo de retirada de material*',
+    '',
+    `*Protocolo:* ${refLote}`,
+    `*Gerado:* ${geradoEm}`,
     '',
   ];
 
   if (temCfg) {
-    out.push('Dados do projeto (configuração):');
-    if (cliente) out.push(`  Cliente:        ${cliente}`);
-    if (projeto) out.push(`  Projeto:        ${projeto}`);
-    if (contrato) out.push(`  Contrato:       ${contrato}`);
-    if (local) out.push(`  Local:          ${local}`);
+    out.push('*Dados do projeto*');
+    if (cliente) out.push(`Cliente: ${cliente}`);
+    if (projeto) out.push(`Projeto: ${projeto}`);
+    if (contrato) out.push(`Contrato: ${contrato}`);
+    if (local) out.push(`Local: ${local}`);
     out.push('');
   }
 
-  out.push('Identificação:');
-  out.push('  Atendido (quem retirou):');
-  out.push(...quebrarTextoParaRecibo(recebedor, REC_WRAP - 4, '    '));
-  out.push(`    ${linhaMatriculaFuncaoReciboCompacta(matRecRecibo, funRecRecibo)}`);
-  out.push('  Atendente (operador):');
-  out.push(...quebrarTextoParaRecibo(atendente, REC_WRAP - 4, '    '));
-  out.push(`    ${linhaMatriculaFuncaoReciboCompacta(matAtRecibo, funAtRecibo)}`);
+  out.push('*Identificação*');
+  out.push('*Quem retirou*');
+  out.push(...quebrarTextoParaRecibo(recebedor, REC_WRAP - 2, ''));
+  out.push(linhaMatriculaFuncaoReciboCompacta(matRecRecibo, funRecRecibo));
+  out.push('');
+  out.push('*Operador (atendente)*');
+  out.push(...quebrarTextoParaRecibo(atendente, REC_WRAP - 2, ''));
+  out.push(linhaMatriculaFuncaoReciboCompacta(matAtRecibo, funAtRecibo));
   out.push('');
 
   if (docRefCabecalhoTemConteudo(docRef)) {
-    const docTitulo = `${docRef!.numero ?? '—'} Rev. ${docRef!.revisao ?? '—'}`;
-    out.push('Documento de referência (planejamento):');
-    out.push('  Documento (nº / revisão):');
-    out.push(...quebrarTextoParaRecibo(docTitulo, REC_WRAP - 4, '    '));
-    out.push('  Responsável (documento):');
-    out.push(...quebrarTextoParaRecibo((docRef!.responsavel ?? '—').trim() || '—', REC_WRAP - 4, '    '));
-    out.push('  Descrição do documento:');
-    out.push(...quebrarTextoParaRecibo((docRef!.descricao ?? '—').trim() || '—', REC_WRAP - 4, '    '));
+    out.push('*Documento de referência*');
+    out.push(tituloDocumentoReciboCompartilhavel(docRef!.numero ?? '—', docRef!.revisao ?? ''));
+    if (String(docRef!.responsavel ?? '').trim()) {
+      out.push(`Responsável: ${String(docRef!.responsavel).trim()}`);
+    }
+    if (String(docRef!.descricao ?? '').trim()) {
+      out.push(...quebrarTextoParaRecibo(String(docRef!.descricao), REC_WRAP, ''));
+    }
     out.push('');
+  } else {
+    out.push(...linhasListaDocumentosProtocolo(docsProtocolo));
   }
 
-  out.push('Retirada interna:');
-  out.push('  Material retirado por colaborador cadastrado (registro vinculado ao atendimento).');
-  out.push('');
-  out.push('Itens desta retirada (código e descrição completos, sem cortar)');
+  out.push('*Itens da retirada*');
   out.push(...linhasTab);
   out.push('');
-  out.push(`Total de unidades (esta sessão): ${totalUnidades.toLocaleString('pt-BR')}`);
+  out.push(`*Total:* ${totalUnidades.toLocaleString('pt-BR')} unidades`);
   out.push('');
-  out.push('Assinaturas:');
-  out.push('');
-  out.push('Atendente (operador):');
-  out.push(...quebrarTextoParaRecibo(atendente, REC_WRAP - 2, '  '));
-  out.push(`  ${linhaMatriculaFuncaoReciboCompacta(matAtRecibo, funAtRecibo)}`);
-  out.push('');
-  out.push('Atendido (quem retirou):');
-  out.push(...quebrarTextoParaRecibo(recebedor, REC_WRAP - 2, '  '));
-  out.push(`  ${linhaMatriculaFuncaoReciboCompacta(matRecRecibo, funRecRecibo)}`);
-  out.push('');
-  out.push('__________________________     __________________________');
-  out.push('');
-  out.push(REC_SEP);
+  out.push('_Retirada interna — colaborador cadastrado no I.S.O PRO._');
+  out.push(`_Referência: ${refLote}_`);
 
   return out.join('\n');
 }
 
-function escapeHtmlRecibo(s: string): string {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
-function blocoPreEscapedLinhas(linhas: string[]): string {
-  return linhas.map((l) => escapeHtmlRecibo(l)).join('<br/>');
-}
-
-function blocoPreFromQuebra(texto: string, largura: number, indent: string): string {
-  return blocoPreEscapedLinhas(quebrarTextoParaRecibo(texto, largura, indent));
-}
-
 /**
- * Corpo dos itens em HTML: tabela compacta (usa a largura A4, menos páginas que blocos empilhados).
- */
-function montarHtmlBlocosReciboPc(
-  linhas: LinhaSessaoAtendimento[],
-  opts?: { omitProtoNumeroQuandoLote?: string | null },
-): { html: string; totalUnidades: number } {
-  const omit = (opts?.omitProtoNumeroQuandoLote ?? '').trim();
-  const parts: string[] = [];
-  let idx = 0;
-  let total = 0;
-  let i = 0;
-
-  const thead =
-    '<thead><tr>' +
-    '<th class="col-num">#</th>' +
-    '<th class="col-cod">Código</th>' +
-    '<th class="col-desc">Descrição do material</th>' +
-    '<th class="col-un">UN</th>' +
-    '<th class="col-qtd">Qtd</th>' +
-    '</tr></thead>';
-
-  while (i < linhas.length) {
-    const row = linhas[i]!;
-    if (row.tipo === 'documento') {
-      parts.push('<section class="grp">');
-      parts.push('<p class="grp-tit">Documento (agrupamento por desenho)</p>');
-      const docTitulo = `${String(row.docNumero ?? '').trim()}  Rev. ${String(row.docRevisao ?? '').trim()}`.trim();
-      parts.push(`<p class="doc-tit">${escapeHtmlRecibo(docTitulo)}</p>`);
-      if (!omit || String(row.loteNumero) !== omit) {
-        parts.push(`<p class="proto">Lote / protocolo: ${escapeHtmlRecibo(String(row.loteNumero))}</p>`);
-      }
-      parts.push(`<table class="itens-tbl">${thead}<tbody>`);
-      for (const it of row.itens) {
-        idx += 1;
-        const q = Number(it.qtd) || 0;
-        total += q;
-        const un = String(it.unidade ?? 'UN');
-        parts.push(
-          `<tr><td class="col-num">${idx}</td><td class="col-cod">${escapeHtmlRecibo(String(it.codigo ?? '—'))}</td>` +
-            `<td class="col-desc">${escapeHtmlRecibo(String(it.descricao ?? '—'))}</td>` +
-            `<td class="col-un">${escapeHtmlRecibo(un)}</td><td class="col-qtd">${escapeHtmlRecibo(String(q))}</td></tr>`,
-        );
-      }
-      parts.push('</tbody></table></section>');
-      i += 1;
-      continue;
-    }
-    const proto = row.loteNumero;
-    const run: LinhaSessaoAtendimento[] = [];
-    while (i < linhas.length && linhas[i]!.tipo === 'codigo_barras' && linhas[i]!.loteNumero === proto) {
-      run.push(linhas[i]!);
-      i += 1;
-    }
-    const primeiroComDoc = run.find(
-      (r): r is Extract<LinhaSessaoAtendimento, { tipo: 'codigo_barras' }> =>
-        r.tipo === 'codigo_barras' && Boolean(r.documentoPlanejamento?.numero?.trim()),
-    );
-    parts.push('<section class="grp">');
-    if (primeiroComDoc?.documentoPlanejamento) {
-      const dp = primeiroComDoc.documentoPlanejamento;
-      parts.push('<p class="sub-tit">Documento no planejamento (referência)</p>');
-      const refLinha = `${String(dp.numero).trim()}  Rev. ${String(dp.revisao ?? '').trim()}`;
-      parts.push(`<p class="doc-ref">${escapeHtmlRecibo(refLinha)}</p>`);
-      const meta: string[] = [];
-      if (String(dp.responsavel ?? '').trim()) {
-        meta.push(`<span><strong>Responsável:</strong> ${escapeHtmlRecibo(String(dp.responsavel).trim())}</span>`);
-      }
-      if (String(dp.descricao ?? '').trim()) {
-        meta.push(`<span><strong>Descrição:</strong> ${escapeHtmlRecibo(String(dp.descricao))}</span>`);
-      }
-      if (meta.length) parts.push(`<p class="doc-meta">${meta.join(' · ')}</p>`);
-    }
-    if (omit && String(proto) === omit) {
-      parts.push('<p class="proto proto-hint">Baixa por código · protocolo indicado no cabeçalho deste recibo.</p>');
-    } else {
-      parts.push(`<p class="proto">Lote / protocolo: ${escapeHtmlRecibo(String(proto))} (baixa por código)</p>`);
-    }
-    parts.push(`<table class="itens-tbl">${thead}<tbody>`);
-    for (const r of run) {
-      const x = r as Extract<LinhaSessaoAtendimento, { tipo: 'codigo_barras' }>;
-      idx += 1;
-      const q = Number(x.atendidoTotal) || 0;
-      total += q;
-      const un = String(x.material.unidade ?? 'UN');
-      parts.push(
-        `<tr><td class="col-num">${idx}</td><td class="col-cod">${escapeHtmlRecibo(String(x.material.codigo ?? '—'))}</td>` +
-          `<td class="col-desc">${escapeHtmlRecibo(String(x.material.descricao ?? '—'))}</td>` +
-          `<td class="col-un">${escapeHtmlRecibo(un)}</td><td class="col-qtd">${escapeHtmlRecibo(String(q))}</td></tr>`,
-      );
-    }
-    parts.push('</tbody></table></section>');
-  }
-  return { html: parts.join('\n'), totalUnidades: total };
-}
-
-const RECIBO_HTML_CSS = `*{box-sizing:border-box}
-@page{size:A4;margin:10mm 12mm}
-body{margin:0;padding:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;font-size:9.5px;line-height:1.4;color:#0f172a;background:#e2e8f0;-webkit-print-color-adjust:exact;print-color-adjust:exact}
-.wrap{max-width:100%;width:100%;margin:0 auto;padding:10px 12px 16px}
-.hdr{background:linear-gradient(180deg,#1e3a5f 0%,#1a365d 100%);color:#fff;padding:12px 14px;border-radius:8px 8px 0 0;border:1px solid #0f2942;border-bottom:none}
-.hdr h1{margin:0;font-size:11.5px;font-weight:700;line-height:1.3;letter-spacing:-.01em}
-.hdr .meta{margin:8px 0 0;font-size:8.75px;opacity:.93;line-height:1.45}
-.hdr .meta strong{font-weight:600;opacity:1}
-.sheet{background:#fff;padding:12px 14px 14px;border:1px solid #c5ccd6;border-top:none;border-radius:0 0 8px 8px;box-shadow:0 4px 14px rgba(15,23,42,.07)}
-.sec{margin:0;padding:12px 0;border-bottom:1px solid #e8edf3}
-.itens-sec{border-bottom:none}
-.sec-tit{font-weight:700;color:#1a365d;margin:0 0 10px;font-size:9.5px;letter-spacing:.04em;text-transform:uppercase}
-.id-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:0}
-.id-slot{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 10px 8px;text-align:left}
-.id-slot .slot-label{font-size:7.75px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin:0 0 8px}
-.id-slot .ass-nome-principal,.id-slot .ass-meta-linha{text-align:left}
-.prewrap{white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
-.def-grid{display:grid;grid-template-columns:minmax(108px,32%) 1fr;gap:8px 14px;margin:0;font-size:9px;align-items:start}
-.def-grid dt{margin:0;color:#64748b;font-weight:600;line-height:1.35}
-.def-grid dd{margin:0;color:#0f172a;font-weight:500;line-height:1.4}
-.retirada-nota{margin:0;padding:10px 12px;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:8px;font-size:9px;color:#475569;line-height:1.45}
-.itens-sec{padding:4px 0 0}
-.itens-sec .sec-tit{margin-bottom:8px}
-.items-lead{margin:-4px 0 10px;font-size:8.25px;color:#64748b;font-weight:500}
-.grp{border:1px solid #e2e8f0;border-radius:8px;padding:8px 10px;margin:0 0 10px;background:#fafbfc;page-break-inside:avoid}
-.grp:last-child{margin-bottom:0}
-.grp-tit{font-weight:700;margin:0 0 6px;color:#1a365d;font-size:8.5px;letter-spacing:.04em;text-transform:uppercase}
-.sub-tit{font-weight:700;margin:0 0 4px;font-size:8.5px;color:#475569}
-.doc-tit,.doc-ref{font-weight:600;margin:0 0 4px;font-size:10px;color:#0f172a}
-.doc-meta{margin:6px 0 8px;font-size:8.25px;color:#475569;line-height:1.4}
-.proto{font-size:8.5px;color:#475569;margin:0 0 8px;line-height:1.35}
-.proto-hint{font-style:italic;color:#64748b}
-.itens-tbl{width:100%;border-collapse:collapse;font-size:8.25px;margin:0;table-layout:fixed}
-.itens-tbl th,.itens-tbl td{border:1px solid #cbd5e1;padding:5px 6px;vertical-align:top;word-wrap:break-word;overflow-wrap:anywhere}
-.itens-tbl thead th{background:#e2e8f0;color:#1e293b;font-weight:600;text-align:left;font-size:8px}
-.itens-tbl .col-num{width:5%;text-align:center}
-.itens-tbl .col-cod{width:19%;font-size:7.75px}
-.itens-tbl .col-desc{width:54%}
-.itens-tbl .col-un{width:9%;text-align:center}
-.itens-tbl .col-qtd{width:11%;text-align:right;font-variant-numeric:tabular-nums}
-.itens-tbl tbody tr:nth-child(even){background:#f8fafc}
-.tot{font-weight:700;margin:12px 0 0;padding:8px 12px;background:linear-gradient(180deg,#ecfdf5 0%,#d1fae5 100%);border:1px solid #a7f3d0;border-radius:8px;font-size:9.5px;color:#065f46;text-align:center}
-.sig{margin:0;padding:12px 0 4px;border-top:none}
-.sig .sec-tit{margin-bottom:12px}
-.sig-grid-pro{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:0}
-.sig-block{text-align:center;padding:0 4px}
-.sig-line{height:32px;margin:0 0 10px;border-bottom:2px solid #1e293b}
-.sig-role{font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#475569;margin:0 0 6px}
-.ass-nome-principal{font-weight:700;font-size:10.5px;color:#0f172a;margin:0 0 4px;line-height:1.25;text-align:center}
-.ass-meta-linha{font-size:8.25px;color:#64748b;margin:0 0 8px;line-height:1.35;text-align:center}
-.sig-foot{font-size:7.5px;color:#94a3b8;margin:6px 0 0;font-style:italic}
-.foot{margin:14px 0 0;padding-top:10px;border-top:1px dashed #cbd5e1;font-size:7.75px;color:#94a3b8;text-align:center;line-height:1.4}
-@media print{
-body{background:#fff!important}
-.wrap{padding:0!important;max-width:none!important}
-.sheet{box-shadow:none!important;border-color:#ccc!important;padding:8px 0!important}
-.grp{background:#fff!important}
-.itens-tbl tbody tr:nth-child(even){background:transparent!important}
-.tot{-webkit-print-color-adjust:exact;print-color-adjust:exact}
-}`;
-
-/**
- * HTML completo para impressão (expo-print). Mesmos dados que `montarTextoReciboSessaoUnificada`; partilha fica em texto.
+ * HTML completo para impressão (expo-print). Layout alinhado ao recibo do I.S.O PRO desktop.
  */
 export function montarHtmlReciboSessaoUnificada(
   linhas: LinhaSessaoAtendimento[],
@@ -1058,9 +1221,12 @@ export function montarHtmlReciboSessaoUnificada(
   if (linhas.length === 0) return '';
   const cfg = contexto?.configuracoesSistema;
   const docRef =
-    docRefCabecalhoTemConteudo(contexto?.documentoReferencia ?? undefined) ?
-      contexto?.documentoReferencia ?? null
-    : documentoReferenciaAPartirDasLinhas(linhas);
+    documentosUnicosNaSessao(linhas).length === 1
+      ? documentoReferenciaAPartirDasLinhas(linhas) ??
+        (docRefCabecalhoTemConteudo(contexto?.documentoReferencia ?? undefined)
+          ? contexto?.documentoReferencia ?? null
+          : null)
+      : null;
   const geradoEm = new Date().toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' });
   const idAs = contexto?.identificacaoAssinaturas;
   const matBrutaAt = (matriculaAtendente ?? '').trim();
@@ -1069,118 +1235,120 @@ export function montarHtmlReciboSessaoUnificada(
   const matRecRecibo = textoCampoReciboOpcional(idAs?.recebedorMatricula);
   const funRecRecibo = textoCampoReciboOpcional(idAs?.recebedorFuncao);
 
-  const cliente = cfgStr(cfg, 'cliente');
-  const projeto = cfgStr(cfg, 'projeto');
-  const contrato = cfgStr(cfg, 'contrato');
-  const local = cfgStr(cfg, 'local');
-  const temCfg = Boolean(cliente || projeto || contrato || local);
-
-  const refLote = ultimoLoteNumeroSessao(linhas);
-  const loteUnico = loteUnicoNaSessao(linhas);
-  const { html: itensHtml, totalUnidades } = montarHtmlBlocosReciboPc(linhas, {
-    omitProtoNumeroQuandoLote: loteUnico,
-  });
-
-  const partes: string[] = [];
-  partes.push('<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8"/>');
-  partes.push('<meta name="viewport" content="width=device-width,initial-scale=1"/>');
-  partes.push(`<style>${RECIBO_HTML_CSS}</style></head><body><div class="wrap">`);
-  partes.push('<header class="hdr"><h1>I.S.O PRO — Recibo de retirada de material (sessão — app móvel)</h1>');
-  partes.push(
-    `<p class="meta">Gerado em: <strong>${escapeHtmlRecibo(geradoEm)}</strong> · Protocolo: <strong>${escapeHtmlRecibo(String(refLote))}</strong></p></header>`,
-  );
-  partes.push('<div class="sheet">');
-
-  if (temCfg) {
-    partes.push('<section class="sec"><p class="sec-tit">Dados do projeto</p><dl class="def-grid">');
-    if (cliente) partes.push(`<dt>Cliente</dt><dd>${escapeHtmlRecibo(cliente)}</dd>`);
-    if (projeto) partes.push(`<dt>Projeto</dt><dd>${escapeHtmlRecibo(projeto)}</dd>`);
-    if (contrato) partes.push(`<dt>Contrato</dt><dd>${escapeHtmlRecibo(contrato)}</dd>`);
-    if (local) partes.push(`<dt>Local</dt><dd>${escapeHtmlRecibo(local)}</dd>`);
-    partes.push('</dl></section>');
-  }
-
-  partes.push('<section class="sec sec-id"><p class="sec-tit">Identificação</p>');
-  partes.push('<div class="id-grid">');
-  partes.push('<div class="id-slot">');
-  partes.push('<p class="slot-label">Atendido (quem retirou)</p>');
-  partes.push(`<div class="prewrap ass-nome-principal">${blocoPreFromQuebra(recebedor, REC_WRAP - 4, '')}</div>`);
-  partes.push(
-    `<p class="ass-meta-linha">${escapeHtmlRecibo(linhaMatriculaFuncaoReciboCompacta(matRecRecibo, funRecRecibo))}</p>`,
-  );
-  partes.push('</div>');
-  partes.push('<div class="id-slot">');
-  partes.push('<p class="slot-label">Atendente (operador)</p>');
-  partes.push(`<div class="prewrap ass-nome-principal">${blocoPreFromQuebra(atendente, REC_WRAP - 4, '')}</div>`);
-  partes.push(
-    `<p class="ass-meta-linha">${escapeHtmlRecibo(linhaMatriculaFuncaoReciboCompacta(matAtRecibo, funAtRecibo))}</p>`,
-  );
-  partes.push('</div></div></section>');
-
-  if (docRefCabecalhoTemConteudo(docRef)) {
-    const docTitulo = `${docRef!.numero ?? '—'} Rev. ${docRef!.revisao ?? '—'}`;
-    partes.push('<section class="sec"><p class="sec-tit">Documento de referência (planejamento)</p>');
-    partes.push('<dl class="def-grid">');
-    partes.push(`<dt>Nº / revisão</dt><dd><span class="prewrap">${blocoPreFromQuebra(docTitulo, REC_WRAP - 8, '')}</span></dd>`);
-    partes.push(
-      `<dt>Responsável (documento)</dt><dd><span class="prewrap">${blocoPreFromQuebra((docRef!.responsavel ?? '—').trim() || '—', REC_WRAP - 8, '')}</span></dd>`,
-    );
-    partes.push(
-      `<dt>Descrição do documento</dt><dd><span class="prewrap">${blocoPreFromQuebra((docRef!.descricao ?? '—').trim() || '—', REC_WRAP - 8, '')}</span></dd>`,
-    );
-    partes.push('</dl></section>');
-  }
-
-  partes.push('<section class="sec"><p class="sec-tit">Tipo de retirada</p>');
-  partes.push(
-    '<p class="retirada-nota"><strong>Retirada interna.</strong> Material retirado por colaborador cadastrado (registro vinculado ao atendimento).</p></section>',
+  const logoUrl = resolverUrlLogoReciboMobile(cfgStr(cfg, 'logoUrl') || cfgStr(cfg, 'logoInstitucionalUrl'));
+  const segRodape = segmentoRodapeInstituicaoRecibo(
+    cfgStr(cfg, 'documentoRodapeNome') || DOCUMENTO_RODAPE_NOME_PADRAO,
+    cfgStr(cfg, 'documentoRodapeCnpj') || DOCUMENTO_RODAPE_CNPJ_PADRAO,
   );
 
-  partes.push('<section class="sec itens-sec">');
-  partes.push('<p class="sec-tit">Itens desta retirada</p>');
-  partes.push('<p class="items-lead">Quantidades e referências conforme o planejamento e o protocolo acima.</p>');
-  partes.push(itensHtml);
-  partes.push(
-    `<p class="tot">Total de unidades (esta sessão): ${escapeHtmlRecibo(totalUnidades.toLocaleString('pt-BR'))}</p>`,
-  );
-  partes.push('</section>');
+  const lotes = lotesNaSessao(linhas);
+  const refLoteExib = lotes.length <= 1 ? refLoteLabel(linhas) : lotes.map((n) => escapeHtmlRecibo(n)).join(' · ');
+  const refRodape = lotes.length === 1 ? lotes[0]! : lotes.join(' · ');
 
-  partes.push('<section class="sig"><p class="sec-tit">Assinaturas</p>');
-  partes.push('<div class="sig-grid-pro">');
-  partes.push('<div class="sig-block">');
-  partes.push('<div class="sig-line" aria-hidden="true"></div>');
-  partes.push('<p class="sig-role">Atendente (operador)</p>');
-  partes.push(`<div class="prewrap ass-nome-principal">${blocoPreFromQuebra(atendente, REC_WRAP - 4, '')}</div>`);
-  partes.push(
-    `<p class="ass-meta-linha">${escapeHtmlRecibo(linhaMatriculaFuncaoReciboCompacta(matAtRecibo, funAtRecibo))}</p>`,
-  );
-  partes.push('<p class="sig-foot">Assinatura do atendente</p>');
-  partes.push('</div>');
-  partes.push('<div class="sig-block">');
-  partes.push('<div class="sig-line" aria-hidden="true"></div>');
-  partes.push('<p class="sig-role">Atendido (quem retirou)</p>');
-  partes.push(`<div class="prewrap ass-nome-principal">${blocoPreFromQuebra(recebedor, REC_WRAP - 4, '')}</div>`);
-  partes.push(
-    `<p class="ass-meta-linha">${escapeHtmlRecibo(linhaMatriculaFuncaoReciboCompacta(matRecRecibo, funRecRecibo))}</p>`,
-  );
-  partes.push('<p class="sig-foot">Assinatura de quem retirou</p>');
-  partes.push('</div></div></section>');
+  const { html: tabelaHtml, totalUnidades, qtdItens } = montarHtmlTabelaItensReciboSessao(linhas);
+  const classeDensidade = qtdItens > 6 ? ' recibo-body--denso' : '';
 
-  partes.push('<p class="foot">Documento gerado pelo I.S.O PRO — Campo · conferir os dados antes de assinar.</p>');
-  partes.push('</div></div></body></html>');
+  const docTitulo =
+    docRefCabecalhoTemConteudo(docRef) ?
+      `${docRef!.numero ?? '—'} Rev. ${docRef!.revisao ?? '—'}`
+    : '—';
 
-  return partes.join('');
+  const docsUnicos = documentosUnicosNaSessao(linhas);
+  const gridDocHtml =
+    docRefCabecalhoTemConteudo(docRef) ?
+      `<p><strong>Documento:</strong> ${escapeHtmlRecibo(docTitulo)}</p>
+      <p><strong>Responsavel (documento):</strong> ${escapeHtmlRecibo(textoCampoReciboOpcional(docRef!.responsavel))}</p>`
+    : docsUnicos.length > 1 ?
+      `<p><strong>Documentos:</strong> ${escapeHtmlRecibo(docsUnicos.join(' · '))}</p>
+      <p class="recibo-aviso-multi-doc">Varios desenhos neste protocolo — veja a coluna Documento na tabela abaixo.</p>`
+    : '';
+
+  const descDocHtml =
+    docRefCabecalhoTemConteudo(docRef) && String(docRef!.descricao ?? '').trim() ?
+      `<div class="recibo-doc-desc">
+      <strong>Descricao do documento</strong>
+      <p style="margin: 6px 0 0">${escapeHtmlRecibo(String(docRef!.descricao).trim())}</p>
+    </div>`
+    : '';
+
+  const atendenteAss = nomeExibicaoAtendenteAssinatura(atendente, matBrutaAt || undefined);
+  const metaAt = linhaMatriculaFuncaoAssinatura(matAtRecibo, funAtRecibo);
+  const metaRec = linhaMatriculaFuncaoAssinatura(matRecRecibo, funRecRecibo);
+
+  return `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Recibo ${escapeHtmlRecibo(refRodape)}</title>
+  <style>${cssReciboAtendimentoLayout()}</style>
+</head>
+<body class="recibo-body${classeDensidade}">
+  <div class="recibo-sheet">
+  <div class="inst-topbar recibo-topbar">
+    <span>Gerado em: ${escapeHtmlRecibo(geradoEm)}</span>
+    <span>Recibo ${escapeHtmlRecibo(refRodape)}</span>
+  </div>
+
+  <header class="recibo-header-main recibo-header-main--titulo-centro">
+    ${htmlLogoRecibo(logoUrl)}
+    <div class="inst-title-col recibo-titulo-centro">
+      <h1>Recibo de retirada de material</h1>
+    </div>
+  </header>
+
+  <section class="bloco recibo-bloco-info">
+    <div class="grid2">
+      <p><strong>Lote / atendimento:</strong> ${refLoteExib}</p>
+      <p><strong>Data e hora:</strong> ${escapeHtmlRecibo(geradoEm)}</p>
+      ${gridDocHtml}
+    </div>
+    ${descDocHtml}
+  </section>
+
+  <p class="recibo-tipo-badge" role="note">
+    <strong>Retirada interna</strong> — material entregue a colaborador cadastrado; identificacao vinculada ao registro deste atendimento (arquivo e auditoria).
+  </p>
+
+  <section class="bloco recibo-bloco-itens">
+    <h2>Itens desta retirada</h2>
+    ${tabelaHtml}
+  </section>
+
+  <div class="recibo-fechamento">
+    <div class="recibo-total-linha"><strong>Total de unidades (esta operacao):</strong> ${escapeHtmlRecibo(String(totalUnidades))}</div>
+
+  <div class="recibo-rodape-fin">
+  ${htmlAssinaturasRecibo(atendenteAss, metaAt, recebedor.trim() || '—', metaRec)}
+  <p class="recibo-doc-foot" role="contentinfo">Documento gerado eletronicamente pelo I.S.O PRO${segRodape}. Conteudo para arquivo e auditoria. Referencia: ${escapeHtmlRecibo(refRodape)}.</p>
+  </div>
+  </div>
+  </div>
+</body>
+</html>`;
+}
+
+function refLoteLabel(linhas: LinhaSessaoAtendimento[]): string {
+  const lotes = lotesNaSessao(linhas);
+  if (lotes.length === 1) return escapeHtmlRecibo(lotes[0]!);
+  return escapeHtmlRecibo(ultimoLoteNumeroSessao(linhas));
 }
 
 export function gerarNumeroAtendimento(cfg: Record<string, unknown>): string {
   const seq = (Number(cfg.sequenciaAtendimento) || 0) + 1;
   cfg.sequenciaAtendimento = seq;
-  const data = new Date();
-  const y = data.getFullYear();
-  const mo = String(data.getMonth() + 1).padStart(2, '0');
-  const d = String(data.getDate()).padStart(2, '0');
-  const numSeq = String(seq).padStart(5, '0');
-  return `ATD-${y}${mo}${d}-${numSeq}`;
+  return formatNumeroAtendimento(seq);
+}
+
+function alocarNovoLote(
+  next: IsoSnapshotPayload,
+  reservaInicial?: { loteNumero: string; loteId: number } | null,
+): { loteNumero: string; loteId: number } {
+  if (reservaInicial?.loteNumero && Number.isFinite(reservaInicial.loteId)) {
+    return { loteNumero: String(reservaInicial.loteNumero).trim(), loteId: reservaInicial.loteId };
+  }
+  const { numero } = reservarProximoNumeroAtendimento(next);
+  return { loteNumero: numero, loteId: Date.now() + Math.floor(Math.random() * 1000) };
 }
 
 /**
@@ -1197,6 +1365,7 @@ export function aplicarAtendimentoLote(
   /** Mesmo protocolo que baixa por código: vários «Registar» na mesma sessão = um único ATD na nuvem. */
   continuacao?: { loteNumero: string; loteId: number } | null,
   identificacaoComplementar?: IdentificacaoComplementarAtendimentoHistorico | null,
+  reservaInicial?: { loteNumero: string; loteId: number } | null,
 ): { ok: true; payload: IsoSnapshotPayload; loteNumero: string; loteId: number } | { ok: false; erro: string } {
   const atendente = (atendenteNome || '').trim() || 'App móvel';
   const matricula = (matriculaAtendente || '').trim() || '-';
@@ -1204,20 +1373,23 @@ export function aplicarAtendimentoLote(
   if (!receb) return { ok: false, erro: 'Informe quem recebeu o material.' };
   const extraIdent = sliceIdentificacaoComplementarParaHistorico(identificacaoComplementar);
 
-  const next = deepClone(payload);
+  const next: IsoSnapshotPayload = { ...payload };
   garantirIdsDocumentosPlanejamento(next);
-  const docs = (next.documentos || []) as DocumentoPlanejamento[];
+  const docs = [...((next.documentos || []) as DocumentoPlanejamento[])];
   const docIdx = docs.findIndex((d) => String(d.id) === String(documentoId));
   if (docIdx === -1) return { ok: false, erro: 'Documento não encontrado.' };
 
-  const doc: DocumentoPlanejamento = deepClone(docs[docIdx]);
-  doc.itens = Array.isArray(doc.itens) ? doc.itens.map((it) => ({ ...it })) : [];
+  const doc: DocumentoPlanejamento = {
+    ...docs[docIdx],
+    itens: Array.isArray(docs[docIdx].itens) ? docs[docIdx].itens!.map((it) => ({ ...it })) : [],
+  };
+  const itensDoc = doc.itens ?? [];
 
   for (const [idxStr, qtdRaw] of Object.entries(quantidadesPorIndice)) {
     const idx = Number(idxStr);
     const qtd = Number(qtdRaw);
     if (!Number.isFinite(qtd) || qtd <= 0) continue;
-    const item = doc.itens[idx] as DocumentoItemPlanejamento | undefined;
+    const item = itensDoc[idx] as DocumentoItemPlanejamento | undefined;
     if (!item) {
       return { ok: false, erro: `Linha ${idx}: item não existe neste documento.` };
     }
@@ -1242,7 +1414,7 @@ export function aplicarAtendimentoLote(
   for (const [idxStr, qtdRaw] of entradas) {
     const idx = Number(idxStr);
     const qtd = Number(qtdRaw);
-    const item = doc.itens[idx] as DocumentoItemPlanejamento | undefined;
+    const item = itensDoc[idx] as DocumentoItemPlanejamento | undefined;
     if (!item) continue;
     const k = codigoMaterialKey(codigoNaLinhaPlanejamento(item));
     if (!k) continue;
@@ -1259,7 +1431,6 @@ export function aplicarAtendimentoLote(
   }
 
   next.configuracoesSistema = { ...(next.configuracoesSistema || {}) };
-  const cfg = next.configuracoesSistema as Record<string, unknown>;
 
   const usarContinuacao =
     continuacao &&
@@ -1273,46 +1444,48 @@ export function aplicarAtendimentoLote(
     loteNumero = String(continuacao!.loteNumero).trim();
     loteId = continuacao!.loteId;
   } else {
-    loteNumero = gerarNumeroAtendimento(cfg);
-    loteId = Date.now() + Math.floor(Math.random() * 1000);
+    const alocado = alocarNovoLote(next, reservaInicial);
+    loteNumero = alocado.loteNumero;
+    loteId = alocado.loteId;
   }
 
-  let hid = nextHistoricoId((next.atendimentoHistorico || []) as { id?: number }[]);
+  const historicoBase = [...((next.atendimentoHistorico || []) as Record<string, unknown>[])];
+  const novasLinhasHistorico: Record<string, unknown>[] = [];
+  let hid = nextHistoricoId(historicoBase as { id?: number }[]);
 
   for (const [idxStr, qtdRaw] of entradas) {
     const idx = Number(idxStr);
     const qtd = Number(qtdRaw);
-    const item = doc.itens[idx] as DocumentoItemPlanejamento;
+    const item = itensDoc[idx] as DocumentoItemPlanejamento;
     if (!item) continue;
     const qAt = quantidadeAtendidaLinha(item);
     item.quantidadeAtendida = qAt + qtd;
     hid += 1;
-    next.atendimentoHistorico = [
-      ...(next.atendimentoHistorico || []),
-      {
-        id: hid,
-        loteId,
-        loteNumero,
-        data: new Date().toISOString(),
-        documento: doc.numero || '-',
-        documentoId: doc.id ?? null,
-        documentoItemId: (item as { id?: string | number }).id ?? null,
-        codigo: codigoNaLinhaPlanejamento(item),
-        descricao: descricaoNaLinhaPlanejamento(item),
-        quantidade: qtd,
-        unidade: item.unidade,
-        atendente,
-        matricula,
-        recebedor: receb,
-        origem: 'mobile',
-        ...extraIdent,
-      },
-    ];
+    novasLinhasHistorico.push({
+      id: hid,
+      loteId,
+      loteNumero,
+      data: new Date().toISOString(),
+      documento: doc.numero || '-',
+      documentoId: doc.id ?? null,
+      documentoItemId: (item as { id?: string | number }).id ?? null,
+      codigo: codigoNaLinhaPlanejamento(item),
+      descricao: descricaoNaLinhaPlanejamento(item),
+      quantidade: qtd,
+      unidade: item.unidade,
+      atendente,
+      matricula,
+      recebedor: receb,
+      origem: 'mobile',
+      ...extraIdent,
+    });
   }
+
+  next.atendimentoHistorico = [...historicoBase, ...novasLinhasHistorico];
 
   if (!usarContinuacao) {
     next.atendimentoLotes = [
-      ...(next.atendimentoLotes || []),
+      ...((next.atendimentoLotes || []) as AtendimentoLote[]),
       {
         id: loteId,
         numero: loteNumero,
@@ -1345,32 +1518,29 @@ export function montarTextoRecibo(
   const matLinhaCompacta = linhaMatriculaFuncaoReciboCompacta(textoCampoReciboOpcional(mat || undefined), '—');
   const geradoEm = new Date().toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' });
   const linhas: string[] = [
-    REC_SEP,
-    'I.S.O PRO — Recibo de retirada de material (app móvel)',
-    REC_SEP,
-    `Gerado em: ${geradoEm}    ·    Lote / atendimento: ${loteNumero}`,
+    '*I.S.O PRO — Recibo de retirada de material*',
     '',
-    'Identificação:',
-    '  Atendido (quem retirou):',
-    ...quebrarTextoParaRecibo(recebedor, REC_WRAP - 4, '    '),
-    '  Atendente (operador):',
-    ...quebrarTextoParaRecibo(atendente, REC_WRAP - 4, '    '),
-    ...(matLinhaCompacta !== '—' ? [`    ${matLinhaCompacta}`] : []),
+    `*Protocolo:* ${loteNumero}`,
+    `*Gerado:* ${geradoEm}`,
     '',
-    'Documento:',
-    '  Número / revisão:',
-    ...quebrarTextoParaRecibo(`${doc.numero ?? '—'} Rev. ${doc.revisao ?? '—'}`, REC_WRAP - 4, '    '),
-    '  Responsável (documento):',
-    ...quebrarTextoParaRecibo(String(doc.responsavel ?? '—').trim() || '—', REC_WRAP - 4, '    '),
-    '  Descrição do documento:',
-    ...quebrarTextoParaRecibo((doc.descricao ?? '—').trim() || '—', REC_WRAP - 4, '    '),
+    '*Identificação*',
+    '*Quem retirou*',
+    ...quebrarTextoParaRecibo(recebedor, REC_WRAP - 2, ''),
+    '*Operador (atendente)*',
+    ...quebrarTextoParaRecibo(atendente, REC_WRAP - 2, ''),
+    ...(matLinhaCompacta !== '—' ? [matLinhaCompacta] : []),
     '',
-    'Itens desta retirada:',
-    `  #  | UN | Qtd | Código | (descrição nas linhas seguintes)`,
+    '*Documento*',
+    tituloDocumentoReciboCompartilhavel(String(doc.numero ?? '—'), String(doc.revisao ?? '')),
+    ...(String(doc.responsavel ?? '').trim() ? [`Responsável: ${String(doc.responsavel).trim()}`] : []),
+    ...(String(doc.descricao ?? '').trim()
+      ? quebrarTextoParaRecibo(String(doc.descricao), REC_WRAP, '')
+      : []),
+    '',
+    '*Itens da retirada*',
   ];
   let idx = 0;
   let total = 0;
-  const W = REC_WRAP - 4;
   for (const [i, q] of Object.entries(quantidades)) {
     if (!Number(q) || Number(q) <= 0) continue;
     const it = doc.itens?.[Number(i)] as DocumentoItemPlanejamento | undefined;
@@ -1378,26 +1548,19 @@ export function montarTextoRecibo(
     idx += 1;
     const qn = Number(q) || 0;
     total += qn;
-    const un = String(it.unidade ?? '');
-    const cod = String(codigoNaLinhaPlanejamento(it) || '—').replace(/\|/g, '/');
-    const desc0 = String(descricaoNaLinhaPlanejamento(it) || '—').replace(/\s+/g, ' ').trim();
-    linhas.push(`  ${String(idx).padStart(2)} | ${un.padEnd(4)} | ${String(qn).padStart(5)} | ${cod}`);
-    linhas.push(...quebrarTextoParaRecibo(desc0, W - 2, '     '));
+    linhas.push(
+      ...linhasItemReciboCompartilhavel(
+        idx,
+        codigoNaLinhaPlanejamento(it) || '—',
+        qn,
+        String(it.unidade ?? 'UN'),
+        descricaoNaLinhaPlanejamento(it) || '—',
+      ),
+    );
   }
   linhas.push('');
-  linhas.push(`Total de unidades (esta operação): ${total.toLocaleString('pt-BR')}`);
+  linhas.push(`*Total:* ${total.toLocaleString('pt-BR')} unidades`);
   linhas.push('');
-  linhas.push('Assinaturas:');
-  linhas.push('');
-  linhas.push('Atendente (operador):');
-  linhas.push(...quebrarTextoParaRecibo(atendente, REC_WRAP - 2, '  '));
-  if (matLinhaCompacta !== '—') linhas.push(`  ${matLinhaCompacta}`);
-  linhas.push('');
-  linhas.push('Atendido (quem retirou):');
-  linhas.push(...quebrarTextoParaRecibo(recebedor, REC_WRAP - 2, '  '));
-  linhas.push('');
-  linhas.push('__________________________     __________________________');
-  linhas.push('');
-  linhas.push(REC_SEP);
+  linhas.push(`_Referência: ${loteNumero}_`);
   return linhas.join('\n');
 }

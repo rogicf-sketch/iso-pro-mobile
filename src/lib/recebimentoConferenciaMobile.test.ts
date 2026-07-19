@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { Recebimento } from 'iso-pro-shared';
 import {
   linhaEstadoConferenciaMobile,
+  listarRecebimentosPendentesConferencia,
   recebimentoEmConferenciaAberta,
   recebimentoPermiteEditarConferencia,
   recebimentoTemConferenciaParcialGravada,
@@ -16,6 +17,25 @@ function recBase(partial: Partial<Recebimento> = {}): Recebimento {
     ...partial,
   } as Recebimento;
 }
+
+describe('listarRecebimentosPendentesConferencia', () => {
+  it('filtra só aguardando conferencia nao finalizados e prioriza em correcao', () => {
+    const lista = listarRecebimentosPendentesConferencia([
+      recBase({ id: 'r1', nota: '100', data: '2026-06-01' }),
+      recBase({ id: 'r2', nota: '200', data: '2026-06-02', modoRecebimento: 'direto' }),
+      recBase({ id: 'r3', nota: '300', data: '2026-06-03', statusConferencia: 'conferido' }),
+      recBase({
+        id: 'r4',
+        nota: '400',
+        data: '2026-06-04',
+        itens: [{ codigo: 'X', quantidade: 10, quantidadeConferida: 8 }],
+      }),
+      recBase({ id: 'r5', nota: '500', data: '2026-06-05' }),
+    ]);
+
+    expect(lista.map((r) => String(r.id))).toEqual(['r4', 'r1', 'r5']);
+  });
+});
 
 describe('recebimentoPermiteEditarConferencia', () => {
   it('permite editar quando pendente e aguardando conferencia', () => {

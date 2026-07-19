@@ -50,6 +50,22 @@ describe('garantirIdsDocumentosPlanejamento', () => {
     expect(String(doc.id).length).toBeGreaterThan(0);
     expect(String(doc.itens![0]!.id).length).toBeGreaterThan(0);
   });
+
+  it('nao altera desenhos que ja tem ids completos', () => {
+    const payload: IsoSnapshotPayload = {
+      documentos: [
+        {
+          id: 'doc-fixo',
+          numero: 'PL-200',
+          revisao: 'B',
+          itens: [{ id: 'item-fixo', codigo: 'M1', quantidade: 1, quantidadeAtendida: 0 }],
+        },
+      ],
+    };
+    garantirIdsDocumentosPlanejamento(payload);
+    expect(payload.documentos![0]!.id).toBe('doc-fixo');
+    expect(payload.documentos![0]!.itens![0]!.id).toBe('item-fixo');
+  });
 });
 
 describe('listarDocumentosComDemandaPendenteMaterial', () => {

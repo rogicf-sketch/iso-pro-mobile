@@ -1,50 +1,80 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { router, useFocusEffect } from 'expo-router';
-import { ActivityIndicator, Pressable, RefreshControl, ScrollView, Text, View } from 'react-native';
-import { buildInventarioStyles } from '@/src/theme/buildInventarioStyles';
+import { ActivityIndicator, RefreshControl, ScrollView, View } from 'react-native';
+import { CloudSyncStrip } from '@/src/components/mobile/CloudSyncStrip';
+import { EmptyStatePanel } from '@/src/components/mobile/EmptyStatePanel';
+import { EntityListCard } from '@/src/components/mobile/EntityListCard';
+import { ModuleScreenHeader } from '@/src/components/mobile/ModuleScreenHeader';
+import { PrimaryActionButton } from '@/src/components/mobile/PrimaryActionButton';
+import { StatPillRow } from '@/src/components/mobile/StatPillRow';
+import { buildMobileShellStyles } from '@/src/theme/buildMobileShellStyles';
 import { useMobileUiPreferences } from '@/src/theme/MobileUiPreferencesContext';
 import { useTheme } from '@/src/theme/ThemeContext';
-import { fetchDefaultSnapshot } from '@/src/lib/snapshot';
+import { listInventariosPageFromCloud } from '@/src/lib/escalaCloud';
 import { useSnapshotRefreshOnAppActive } from '@/src/lib/useSnapshotRefreshOnAppActive';
 import { hasSupabaseConfig } from '@/src/lib/config';
-import { formatarDataHoraLocal } from '@/src/lib/formatData';
-import type { InventarioSnapshot, IsoSnapshotPayload } from 'iso-pro-shared';
+import { inventarioTemContagemIniciada } from '@/src/lib/inventarioContagem';
+import { lerRascunhoInventario } from '@/src/lib/inventarioRascunhoStorage';
+import type { InventarioSnapshot } from 'iso-pro-shared';
 
-function deepClone<T>(v: T): T {
-  return JSON.parse(JSON.stringify(v));
-}
-
-function inventariosDisponiveisMobile(payload: IsoSnapshotPayload | null): InventarioSnapshot[] {
-  const list = payload?.inventarios;
-  if (!Array.isArray(list)) return [];
-  return list.filter(
-    (inv) => String(inv.status ?? '') === 'aberto' && Boolean(inv.contagemMobileHabilitada),
-  );
+function inventariosMobileDaLista(rows: Array<Record<string, unknown>>): InventarioSnapshot[] {
+  return rows
+    .filter(
+      (inv) =>
+        String(inv.status ?? '') === 'aberto' &&
+        (inv.contagemMobileHabilitada === true || String(inv.contagemMobileHabilitada) === 'true'),
+    )
+    .map(
+      (inv) =>
+        ({
+          id: inv.id,
+          codigo: inv.codigo,
+          descricao: inv.descricao,
+          responsavel: inv.responsavel,
+          dataInventario: inv.dataInventario,
+          status: inv.status,
+          contagemMobileHabilitada: true,
+          itens: [],
+        }) as InventarioSnapshot,
+    );
 }
 
 export default function InventarioListScreen() {
   const { colors } = useTheme();
+  const shell = useMemo(() => buildMobileShellStyles(colors), [colors]);
   const { mostrarTextosAjudaModulos } = useMobileUiPreferences();
-  const styles = useMemo(() => buildInventarioStyles(colors), [colors]);
   const configured = useMemo(() => hasSupabaseConfig(), []);
 
   const [loading, setLoading] = useState(false);
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [nuvemAt, setNuvemAt] = useState<string | null>(null);
-  const [payload, setPayload] = useState<IsoSnapshotPayload | null>(null);
+  const [lista, setLista] = useState<InventarioSnapshot[]>([]);
+  const [totalNuvem, setTotalNuvem] = useState(0);
+  const [contagemIniciada, setContagemIniciada] = useState<Record<string, boolean>>({});
 
   const carregarNuvem = useCallback(async () => {
     setLoadErr(null);
     setLoading(true);
     try {
-      const { payload: p, updatedAt, error } = await fetchDefaultSnapshot();
-      if (error) {
-        setLoadErr(error);
-        setPayload(null);
+      const page = await listInventariosPageFromCloud({
+        status: 'aberto',
+        offset: 0,
+        limit: 100,
+      });
+      if (page.error && page.missing) {
+        setLoadErr(
+          'Lista paginada de inventário indisponível. Active a estrutura de escala no PC (Configurações).',
+        );
+        setLista([]);
+        setTotalNuvem(0);
         return;
       }
-      setPayload(p ? deepClone(p) : null);
-      setNuvemAt(updatedAt);
+      if (page.error) {
+        setLoadErr(page.error);
+      }
+      setLista(inventariosMobileDaLista(page.inventarios));
+      setTotalNuvem(page.total);
+      setNuvemAt(new Date().toISOString());
     } finally {
       setLoading(false);
     }
@@ -58,66 +88,75 @@ export default function InventarioListScreen() {
 
   useSnapshotRefreshOnAppActive(carregarNuvem);
 
-  const lista = useMemo(() => inventariosDisponiveisMobile(payload), [payload]);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const flags: Record<string, boolean> = {};
+      for (const inv of lista) {
+        const invId = String(inv.id ?? '');
+        if (!invId) continue;
+        const draft = await lerRascunhoInventario(invId);
+        flags[invId] = inventarioTemContagemIniciada(inv.itens ?? [], draft?.qtdTextoPorItemId ?? {});
+      }
+      if (!cancelled) setContagemIniciada(flags);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [lista]);
 
   return (
     <ScrollView
-      contentContainerStyle={styles.container}
+      contentContainerStyle={shell.screenPad}
       refreshControl={<RefreshControl refreshing={loading} onRefresh={() => void carregarNuvem()} />}
-      style={styles.scroll}
+      style={{ flex: 1, backgroundColor: colors.bg }}
     >
-      <Text style={styles.title}>Inventário</Text>
-      {mostrarTextosAjudaModulos ? (
-        <Text style={styles.hint}>
-          Lista inventários <Text style={{ fontWeight: '800' }}>abertos</Text> no I.S.O PRO (PC) com a opção «contagem pelo mobile». O inventário tem de ser criado no
-          computador primeiro; depois aparece aqui para os operadores. Toque num cartão para contar quantidades. Contagem por código de barras e sincronização em tempo real
-          virão nas próximas versões.
-        </Text>
-      ) : null}
+      <ModuleScreenHeader
+        kicker="Operação de campo"
+        subtitle="Inventários abertos no PC com contagem mobile activa."
+        helpText="Crie o inventário no PC com «Permitir contagem pelo app mobile». A lista vem paginada da nuvem (sem baixar o snapshot inteiro)."
+        showHelp={mostrarTextosAjudaModulos}
+      />
 
-      {!configured ? (
-        <Text style={styles.err}>Configure o Supabase (EXPO_PUBLIC_SUPABASE_…) para carregar dados da nuvem.</Text>
-      ) : null}
+      <CloudSyncStrip configured={configured} error={loadErr} loading={loading && lista.length === 0} updatedAt={nuvemAt} />
 
-      {loadErr ? <Text style={styles.err}>{loadErr}</Text> : null}
-      {nuvemAt ? (
-        <Text style={styles.meta}>Snapshot nuvem: {formatarDataHoraLocal(nuvemAt)}</Text>
-      ) : configured && !loadErr ? (
-        <Text style={styles.meta}>A carregar dados…</Text>
-      ) : null}
+      <StatPillRow
+        items={[
+          { label: 'Disponíveis', value: lista.length },
+          { label: 'Abertos (nuvem)', value: totalNuvem },
+        ]}
+      />
 
-      {loading && !payload ? (
-        <View style={styles.center}>
+      {loading && lista.length === 0 ? (
+        <View style={{ paddingVertical: 32, alignItems: 'center' }}>
           <ActivityIndicator color={colors.accent} size="large" />
         </View>
       ) : lista.length === 0 ? (
-        <Text style={styles.hintSmall}>
-          Nenhum inventário aberto com mobile habilitado. No PC, crie ou edite um inventário e marque «Permitir contagem pelo app mobile».
-        </Text>
+        <EmptyStatePanel
+          title="Nenhum inventário para contar"
+          message="No PC, crie ou edite um inventário aberto e marque «Permitir contagem pelo app mobile». Depois toque em Atualizar lista."
+        />
       ) : (
-        lista.map((item, index) => (
-          <Pressable
-            key={String(item.id ?? index)}
-            onPress={() => {
-              if (item.id != null) router.push(`/inventario/${encodeURIComponent(String(item.id))}`);
-            }}
-            style={styles.card}
-          >
-            <Text style={styles.cardTitle}>{String(item.codigo ?? '—')}</Text>
-            <Text style={styles.cardSub}>{String(item.descricao ?? '—')}</Text>
-            <Text style={styles.rowMeta}>
-              Responsável: {String(item.responsavel ?? '—')} · Data: {String(item.dataInventario ?? '—')}
-            </Text>
-            <View style={styles.badge}>
-              <Text style={styles.badgeText}>Aberto · mobile</Text>
-            </View>
-          </Pressable>
-        ))
+        lista.map((item, index) => {
+          const invId = String(item.id ?? index);
+          const emCurso = contagemIniciada[invId] === true;
+          return (
+            <EntityListCard
+              key={invId}
+              actionLabel={emCurso ? 'Continuar contagem' : 'Iniciar contagem'}
+              badgeLabel="Aberto · mobile"
+              meta={`Responsável: ${String(item.responsavel ?? '—')} · Data: ${String(item.dataInventario ?? '—')}`}
+              onPress={() => {
+                if (item.id != null) router.push(`/inventario/${encodeURIComponent(String(item.id))}`);
+              }}
+              subtitle={String(item.descricao ?? '—')}
+              title={String(item.codigo ?? '—')}
+            />
+          );
+        })
       )}
 
-      <Pressable disabled={loading} onPress={() => void carregarNuvem()} style={[styles.btn, loading && { opacity: 0.7 }]}>
-        <Text style={styles.btnText}>Atualizar lista</Text>
-      </Pressable>
+      <PrimaryActionButton disabled={loading} label="Atualizar lista" loading={loading} onPress={() => void carregarNuvem()} />
     </ScrollView>
   );
 }

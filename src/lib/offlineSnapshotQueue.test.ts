@@ -168,14 +168,16 @@ describe('offlineSnapshotQueue', () => {
     vi.mocked(commitDefaultSnapshotPatchWrite).mockImplementation(async (prepare) => {
       const plan = await prepare();
       expect(plan.mergeKeys).toEqual(['inventarios']);
-      expect(plan.patch.inventarios).toHaveLength(1);
-      expect(plan.patch.inventarios?.[0]).toMatchObject({ id: 'inv-1', itens: [{ quantidadeContada: 9 }] });
-      expect(plan.patchWithoutMerge?.inventarios).toHaveLength(2);
-      expect(plan.patchWithoutMerge?.inventarios?.[0]).toMatchObject({
+      const patchInventarios = plan.patch.inventarios as Record<string, unknown>[];
+      const semMergeInventarios = plan.patchWithoutMerge?.inventarios as Record<string, unknown>[];
+      expect(patchInventarios).toHaveLength(1);
+      expect(patchInventarios[0]).toMatchObject({ id: 'inv-1', itens: [{ quantidadeContada: 9 }] });
+      expect(semMergeInventarios).toHaveLength(2);
+      expect(semMergeInventarios[0]).toMatchObject({
         id: 'inv-1',
         itens: [{ quantidadeContada: 9 }],
       });
-      expect(plan.patchWithoutMerge?.inventarios?.[1]).toMatchObject({ id: 'inv-2' });
+      expect(semMergeInventarios[1]).toMatchObject({ id: 'inv-2' });
       return { error: null, conflict: false, updatedAt: '2026-01-01' };
     });
 

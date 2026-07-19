@@ -17,14 +17,24 @@ import {
   View,
 } from 'react-native';
 import { BrandLogoPanel } from '@/src/components/BrandLogoPanel';
-import { neonPrimaryButtonExtras } from '@/src/theme/neonButtonExtras';
+import { MetaRow } from '@/src/components/mobile/MetaRow';
+import { PrimaryActionButton } from '@/src/components/mobile/PrimaryActionButton';
+import { SectionCard } from '@/src/components/mobile/SectionCard';
+import { StatPillRow } from '@/src/components/mobile/StatPillRow';
+import { StatusBadge } from '@/src/components/mobile/StatusBadge';
+import { formatarDataHoraLocal } from '@/src/lib/formatData';
 import { hasSupabaseConfig } from '@/src/lib/config';
 import { fetchSnapshotDiagnostics, type SnapshotDiagnostics } from '@/src/lib/snapshot';
-import { getOfflineSnapshotQueueSize } from '@/src/lib/offlineSnapshotQueue';
+import { getOfflineSnapshotQueueSize, flushOfflineSnapshotQueue } from '@/src/lib/offlineSnapshotQueue';
+import { notifyOfflineFlushResult } from '@/src/lib/useOfflineSnapshotAutoFlush';
+import { getAtendimentoComandoQueueSize } from '@/src/lib/atendimentoComando';
+import { reportMobileSyncHealthToCloud } from '@/src/lib/mobileSyncHealth';
 import { resolveMobileAccess, type MobileAccessResult } from '@/src/lib/mobileAccess';
 import { getStoredMobileSession, logoutMobile, type MobileSession } from '@/src/lib/mobileAuth';
 import { getStoredDeviceRecord, type MobileDeviceRecord } from '@/src/lib/mobileDevice';
 import { useMobileUiPreferences } from '@/src/theme/MobileUiPreferencesContext';
+import { buildMobileShellStyles } from '@/src/theme/buildMobileShellStyles';
+import { neonPrimaryButtonExtras } from '@/src/theme/neonButtonExtras';
 import { useTheme } from '@/src/theme/ThemeContext';
 import { THEME_ORDER, themes } from '@/src/theme/tokens';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -39,6 +49,7 @@ export default function HomeScreen() {
   const insets = useSafeAreaInsets();
   const { height: windowHeight } = useWindowDimensions();
   const { themeId, setThemeId, colors } = useTheme();
+  const shell = useMemo(() => buildMobileShellStyles(colors), [colors]);
   const { mostrarTextosAjudaModulos, setMostrarTextosAjudaModulos } = useMobileUiPreferences();
   /** Ecrãs mais baixos: logo menos alto para ganhar espaço útil. */
   const logoCompact = windowHeight < 720;
@@ -78,7 +89,12 @@ export default function HomeScreen() {
   }, [router]);
 
   const refreshOfflineQueueSize = useCallback(async () => {
-    setOfflineQueueSize(await getOfflineSnapshotQueueSize());
+    const [offline, atendimento] = await Promise.all([
+      getOfflineSnapshotQueueSize(),
+      getAtendimentoComandoQueueSize(),
+    ]);
+    setOfflineQueueSize(offline + atendimento);
+    void reportMobileSyncHealthToCloud();
   }, []);
 
   useEffect(() => {
@@ -89,6 +105,8 @@ export default function HomeScreen() {
   const onPullRefresh = useCallback(async () => {
     setPullRefreshing(true);
     try {
+      const flush = await flushOfflineSnapshotQueue();
+      notifyOfflineFlushResult(flush);
       await refreshSessionAndDevice();
       await refreshOfflineQueueSize();
       if (hasSupabaseConfig()) {
@@ -386,7 +404,7 @@ export default function HomeScreen() {
           <>
         <Text style={styles.sub}>
         {supabaseOk
-          ? 'Conferência, atendimento, inventário (contagem) e consulta a documentos e recebimentos — ligado ao Supabase.'
+          ? 'Conferência, atendimento, inventário e consulta (desenhos e recebimentos) — ligado ao Supabase.'
           : 'Conferência, atendimento e consulta ao planejamento. Crie um ficheiro .env na raiz do projeto com '}
         {!supabaseOk ? (
           <>
@@ -399,7 +417,7 @@ export default function HomeScreen() {
 
       <Text style={[styles.sectionTit, { marginTop: 8 }]}>FUNÇÕES</Text>
       <Text style={styles.sectionSub}>
-        Atalhos para conferência, atendimento, inventário e consulta — documentos cadastrados e recebimentos (só leitura).
+        Atalhos para conferência, atendimento, inventário e consulta só leitura (desenhos ou recebimentos).
       </Text>
       <View style={styles.grid}>
         <Link href="/(tabs)/conferencia" asChild>
@@ -434,8 +452,8 @@ export default function HomeScreen() {
             <View style={styles.cardIconWrap}>
               <MaterialCommunityIcons name="file-document-multiple-outline" size={26} color={colors.accent} />
             </View>
-            <Text style={styles.cardTitle}>Documentos cadastrados</Text>
-            <Text style={styles.cardHint}>Desenhos no planejamento</Text>
+            <Text style={styles.cardTitle}>Consulta · desenhos</Text>
+            <Text style={styles.cardHint}>Planejamento (só leitura)</Text>
           </Pressable>
         </Link>
         <Link href="/(tabs)/consulta?sec=recebimento" asChild>
@@ -443,53 +461,30 @@ export default function HomeScreen() {
             <View style={styles.cardIconWrap}>
               <MaterialCommunityIcons name="truck-delivery-outline" size={26} color={colors.accent} />
             </View>
-            <Text style={styles.cardTitle}>Recebimento</Text>
-            <Text style={styles.cardHint}>Materiais recebidos (NF)</Text>
+            <Text style={styles.cardTitle}>Consulta · recebimentos</Text>
+            <Text style={styles.cardHint}>NF / romaneio (só leitura)</Text>
           </Pressable>
         </Link>
       </View>
 
-      <View style={[styles.sessionCard, { marginTop: 22 }]}>
-        <View style={styles.sessionCardInner}>
-          <Text style={styles.sessionKicker}>CONTA E ACESSO</Text>
-          <Text style={styles.sessionTitle}>Sessão ativa</Text>
-          <View style={styles.sessionRow}>
-            <Text style={styles.sessionLabel}>Usuário</Text>
-            <Text style={styles.sessionValue}>{session?.nome ?? '—'}</Text>
-          </View>
-          <View style={styles.sessionRow}>
-            <Text style={styles.sessionLabel}>Login</Text>
-            <Text style={styles.sessionValue}>{session?.login ?? '—'}</Text>
-          </View>
-          <View style={styles.sessionRow}>
-            <Text style={styles.sessionLabel}>Dispositivo</Text>
-            <Text style={styles.sessionValue}>{device?.nomeAparelho ?? '—'}</Text>
-          </View>
-          <View style={styles.sessionRow}>
-            <Text style={styles.sessionLabel}>Versão instalada</Text>
-            <Text style={styles.sessionValue}>{versaoBinario}</Text>
-          </View>
-          <View style={styles.sessionRow}>
-            <Text style={styles.sessionLabel}>Status do acesso</Text>
-            <Text style={styles.sessionValue}>{accessInfo?.state ?? 'local'}</Text>
-          </View>
-          <View style={[styles.sessionRow, styles.sessionRowLast]}>
-            <Text style={styles.sessionLabel}>Origem da validação</Text>
-            <Text style={styles.sessionValue}>{accessInfo?.source ?? 'local'}</Text>
-          </View>
+      <View style={{ marginTop: 22 }}>
+        <SectionCard title="Conta e acesso">
+          <MetaRow label="Usuário" value={session?.nome ?? '—'} />
+          <MetaRow label="Login" value={session?.login ?? '—'} />
+          <MetaRow label="Dispositivo" value={device?.nomeAparelho ?? '—'} />
+          <MetaRow label="Versão instalada" value={versaoBinario} />
+          <MetaRow label="Status do acesso" value={accessInfo?.state ?? 'local'} />
+          <MetaRow isLast label="Origem da validação" value={accessInfo?.source ?? 'local'} />
+          {accessInfo?.state === 'authorized' ? <StatusBadge label="Acesso autorizado" tone="success" /> : null}
+          {accessInfo?.state === 'pending' ? <StatusBadge label="Aguardando aprovação" tone="warn" /> : null}
+          {accessInfo?.state === 'blocked' ? <StatusBadge label="Acesso bloqueado" tone="danger" /> : null}
           {offlineQueueSize > 0 ? (
-            <Text style={[styles.sessionWarn, { marginTop: 10 }]}>
-              Fila offline: {offlineQueueSize} alteracao(oes) aguardam sincronizacao com a nuvem.
-            </Text>
+            <StatusBadge label={`Fila offline: ${offlineQueueSize} alteração(ões)`} tone="warn" />
           ) : null}
           {accessInfo?.offlineUnverified ? (
-            <Text style={[styles.sessionWarn, { marginTop: 10 }]}>
-              Modo offline: controlo de aparelho nao verificado no servidor.
-            </Text>
+            <StatusBadge label="Modo offline — aparelho não verificado no servidor" tone="info" />
           ) : null}
-          {accessInfo?.warning ? (
-            <Text style={[styles.sessionWarn, { marginTop: 10 }]}>Aviso: {accessInfo.warning}</Text>
-          ) : null}
+          {accessInfo?.warning ? <StatusBadge label={`Aviso: ${accessInfo.warning}`} tone="warn" /> : null}
           <Pressable
             onPress={() => {
               if (!session) return;
@@ -507,7 +502,7 @@ export default function HomeScreen() {
                 });
             }}
             disabled={refreshingAccess}
-            style={styles.refreshButton}
+            style={[styles.refreshButton, { marginTop: 14 }]}
           >
             {refreshingAccess ? (
               <ActivityIndicator color={colors.primaryBtnText} />
@@ -520,59 +515,67 @@ export default function HomeScreen() {
               <Text style={styles.feedbackText}>{vinculoFeedback}</Text>
             </View>
           ) : null}
-          {supabaseOk ? (
-            <>
-              <Text style={[styles.sessionKicker, { marginTop: 18 }]}>PLANEJAMENTO</Text>
-              <Pressable
-                onPress={() => {
-                  setDiagLoading(true);
-                  void fetchSnapshotDiagnostics()
-                    .then(setDiag)
-                    .finally(() => setDiagLoading(false));
-                }}
-                disabled={diagLoading}
-                style={[styles.logoutButton, { backgroundColor: colors.surfaceElevated, marginTop: 6 }]}
-              >
-                {diagLoading ? (
-                  <ActivityIndicator color={colors.text} />
-                ) : (
-                  <Text style={styles.logoutText}>Verificar leitura do snapshot</Text>
-                )}
-              </Pressable>
-              {diag ? (
-                <View style={[styles.diagBox, { marginTop: 10 }]}>
-                  <Text style={styles.diagLine}>Servidor: {diag.host}</Text>
-                  <Text style={styles.diagLine}>Linha default: {diag.rowFound ? 'sim' : 'não'}</Text>
-                  <Text style={styles.diagLine}>updated_at: {diag.updatedAt ?? '—'}</Text>
-                  <Text style={styles.diagLine}>
-                    documentos: {diag.documentos} · materiais: {diag.materiais} · receb.: {diag.recebimentos} · colab.: {diag.colaboradores}
-                  </Text>
-                  {diag.primeiroNumeroDocumento ? (
-                    <Text style={styles.diagLine}>1.º nº desenho: {diag.primeiroNumeroDocumento}</Text>
-                  ) : null}
-                  {diag.payloadKeys.length > 0 ? (
-                    <Text style={styles.diagLine}>chaves no JSON: {diag.payloadKeys.join(', ')}</Text>
-                  ) : null}
-                  {diag.error ? <Text style={styles.diagWarn}>Erro: {diag.error}</Text> : null}
-                  {!diag.error && diag.rowFound && diag.documentos === 0 ? (
-                    <Text style={styles.diagWarn}>
-                      O app lê o Supabase, mas o snapshot não tem desenhos (`documentos`). Colaboradores podem aparecer na mesma. É preciso gravar o
-                      planejamento na nuvem pelo I.S.O PRO no navegador (não é ajuste neste ecrã).
-                    </Text>
-                  ) : null}
-                </View>
-              ) : null}
-            </>
-          ) : null}
           <Pressable
             onPress={() => {
               void logoutMobile().then(() => router.replace('/login'));
             }}
-            style={styles.logoutButton}
+            style={[styles.logoutButton, { marginTop: 12 }]}
           >
             <Text style={styles.logoutText}>Sair do app</Text>
           </Pressable>
-        </View>
+        </SectionCard>
+
+        {supabaseOk ? (
+          <SectionCard title="Planejamento na nuvem">
+            <PrimaryActionButton
+              disabled={diagLoading}
+              label="Verificar leitura do snapshot"
+              loading={diagLoading}
+              onPress={() => {
+                setDiagLoading(true);
+                void fetchSnapshotDiagnostics()
+                  .then(setDiag)
+                  .finally(() => setDiagLoading(false));
+              }}
+            />
+            {diag ? (
+              <>
+                <StatPillRow
+                  items={[
+                    { label: 'Documentos', value: diag.documentos },
+                    { label: 'Materiais', value: diag.materiais },
+                    { label: 'Recebimentos', value: diag.recebimentos },
+                    { label: 'Colaboradores', value: diag.colaboradores },
+                  ]}
+                />
+                <MetaRow label="Servidor" value={diag.host} />
+                <MetaRow label="Linha default" value={diag.rowFound ? 'sim' : 'não'} />
+                <MetaRow
+                  isLast={!diag.primeiroNumeroDocumento && diag.payloadKeys.length === 0}
+                  label="Última actualização"
+                  value={diag.updatedAt ? formatarDataHoraLocal(diag.updatedAt) : '—'}
+                />
+                {diag.primeiroNumeroDocumento ? (
+                  <MetaRow isLast={diag.payloadKeys.length === 0} label="1.º nº desenho" value={diag.primeiroNumeroDocumento} />
+                ) : null}
+                {diag.payloadKeys.length > 0 ? (
+                  <MetaRow isLast label="Chaves no JSON" value={diag.payloadKeys.join(', ')} />
+                ) : null}
+                {diag.error ? <Text style={[styles.diagWarn, { marginTop: 10 }]}>Erro: {diag.error}</Text> : null}
+                {!diag.error && diag.rowFound && diag.documentos === 0 ? (
+                  <Text style={[styles.diagWarn, { marginTop: 10 }]}>
+                    O app lê o Supabase, mas o snapshot não tem desenhos (`documentos`). Colaboradores podem aparecer na mesma. É preciso gravar o
+                    planejamento na nuvem pelo I.S.O PRO no navegador (não é ajuste neste ecrã).
+                  </Text>
+                ) : null}
+              </>
+            ) : (
+              <Text style={[shell.helpText, { marginTop: 4 }]}>
+                Confirme se o planejamento do PC chegou à nuvem antes de usar atendimento ou consulta.
+              </Text>
+            )}
+          </SectionCard>
+        ) : null}
       </View>
           </>
         )}

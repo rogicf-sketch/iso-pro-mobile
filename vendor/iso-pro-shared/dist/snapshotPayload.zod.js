@@ -7,6 +7,9 @@ const MAX_SHORT = 2_048;
 const MAX_LIST = 250_000;
 const s = z.string().max(MAX_STRING);
 const sShort = z.string().max(MAX_SHORT);
+/** Postgres/JSON frequentemente devolve `null` em vez de omitir o campo. */
+const sOpt = z.preprocess((v) => (v === null ? undefined : v), s.optional());
+const sShortOpt = z.preprocess((v) => (v === null ? undefined : v), sShort.optional());
 function optionalArray(element) {
     return z.preprocess((v) => {
         if (v === undefined || v === null)
@@ -20,46 +23,46 @@ const modoRecebimentoSchema = z.enum(['direto', 'aguardando_conferencia']);
 const statusConferenciaSchema = z.enum(['pendente', 'conferido']);
 const recebimentoItemSchema = z
     .object({
-    codigo: s.optional(),
-    descricao: s.optional(),
+    codigo: sOpt,
+    descricao: sOpt,
     quantidade: z.union([z.number(), s]).optional(),
     quantidadeConferida: z.union([z.number(), s, z.null()]).optional(),
-    observacaoItem: sShort.optional(),
-    localizacao: sShort.optional(),
-    unidade: sShort.optional(),
-    disciplina: sShort.optional(),
+    observacaoItem: sShortOpt,
+    localizacao: sShortOpt,
+    unidade: sShortOpt,
+    disciplina: sShortOpt,
 })
     .passthrough();
 const materialSchema = z
     .object({
     id: z.union([z.string(), z.number()]).optional(),
-    codigo: sShort.optional(),
-    descricao: s.optional(),
-    unidade: sShort.optional(),
+    codigo: sShortOpt,
+    descricao: sOpt,
+    unidade: sShortOpt,
 })
     .passthrough();
 const colaboradorSchema = z
     .object({
     id: z.union([z.string(), z.number()]),
-    nome: s.optional(),
-    matricula: sShort.optional(),
-    funcao: sShort.optional(),
-    telefone: sShort.optional(),
+    nome: sOpt,
+    matricula: sShortOpt,
+    funcao: sShortOpt,
+    telefone: sShortOpt,
 })
     .passthrough();
 const recebimentoSchema = z
     .object({
     id: z.union([z.string(), z.number()]),
-    data: sShort.optional(),
+    data: sShortOpt,
     fornecedorId: z.number().optional(),
-    fornecedorNome: s.optional(),
-    nota: sShort.optional(),
-    romaneio: sShort.optional(),
+    fornecedorNome: sOpt,
+    nota: sShortOpt,
+    romaneio: sShortOpt,
     conferenteId: z.number().optional(),
-    conferenteNome: s.optional(),
-    observacoes: s.optional(),
+    conferenteNome: sOpt,
+    observacoes: sOpt,
     itens: optionalArray(recebimentoItemSchema),
-    dataCriacao: sShort.optional(),
+    dataCriacao: sShortOpt,
     modoRecebimento: modoRecebimentoSchema.optional(),
     statusConferencia: z.union([statusConferenciaSchema, z.null()]).optional(),
     dataConferencia: z.union([sShort, z.null()]).optional(),
@@ -67,34 +70,34 @@ const recebimentoSchema = z
     .passthrough();
 const documentoItemPlanejamentoSchema = z
     .object({
-    codigo: sShort.optional(),
-    descricao: s.optional(),
+    codigo: sShortOpt,
+    descricao: sOpt,
     quantidade: z.number().optional(),
-    unidade: sShort.optional(),
+    unidade: sShortOpt,
     quantidadeAtendida: z.number().optional(),
 })
     .passthrough();
 const documentoPlanejamentoSchema = z
     .object({
     id: z.union([z.string(), z.number()]),
-    numero: sShort.optional(),
-    revisao: sShort.optional(),
-    data: sShort.optional(),
-    descricao: s.optional(),
-    responsavel: s.optional(),
+    numero: sShortOpt,
+    revisao: sShortOpt,
+    data: sShortOpt,
+    descricao: sOpt,
+    responsavel: sOpt,
     itens: optionalArray(documentoItemPlanejamentoSchema),
 })
     .passthrough();
 const atendimentoLoteSchema = z
     .object({
     id: z.union([z.string(), z.number()]),
-    numero: sShort.optional(),
-    data: sShort.optional(),
-    tipo: sShort.optional(),
-    documento: s.optional(),
-    atendente: s.optional(),
-    matricula: sShort.optional(),
-    recebedor: s.optional(),
+    numero: sShortOpt,
+    data: sShortOpt,
+    tipo: sShortOpt,
+    documento: sOpt,
+    atendente: sOpt,
+    matricula: sShortOpt,
+    recebedor: sOpt,
 })
     .passthrough();
 const atendimentoHistoricoLinhaSchema = z
@@ -102,44 +105,45 @@ const atendimentoHistoricoLinhaSchema = z
     /** Legado app móvel: número sequencial. Desktop: UUID do item do lote. */
     id: z.union([z.string(), z.number()]).optional(),
     loteId: z.union([z.string(), z.number()]).optional(),
-    loteNumero: sShort.optional(),
-    data: sShort.optional(),
-    documento: s.optional(),
+    loteNumero: sShortOpt,
+    data: sShortOpt,
+    documento: sOpt,
     documentoId: z.union([z.string(), z.number(), z.null()]).optional(),
     documentoItemId: z.union([z.string(), z.number(), z.null()]).optional(),
-    codigo: sShort.optional(),
-    descricao: s.optional(),
+    codigo: sShortOpt,
+    descricao: sOpt,
     quantidade: z.number().optional(),
-    unidade: sShort.optional(),
-    atendente: s.optional(),
-    matricula: sShort.optional(),
-    atendenteFuncao: sShort.optional(),
-    recebedor: s.optional(),
-    recebedorMatricula: sShort.optional(),
-    recebedorFuncao: sShort.optional(),
+    unidade: sShortOpt,
+    atendente: sOpt,
+    matricula: sShortOpt,
+    atendenteFuncao: sShortOpt,
+    recebedor: sOpt,
+    recebedorMatricula: sShortOpt,
+    recebedorFuncao: sShortOpt,
     origem: origemRegistroIsoSchema.optional(),
 })
     .passthrough();
 const inventarioItemSnapshotSchema = z
     .object({
-    id: sShort.optional(),
-    codigoMaterial: sShort.optional(),
-    descricaoMaterial: s.optional(),
-    unidade: sShort.optional(),
+    id: sShortOpt,
+    codigoMaterial: sShortOpt,
+    descricaoMaterial: sOpt,
+    unidade: sShortOpt,
     saldoSistema: z.number().optional(),
     quantidadeContada: z.number().optional(),
+    localizacaoContada: sShortOpt,
 })
     .passthrough();
 const inventarioSnapshotSchema = z
     .object({
-    id: sShort.optional(),
-    codigo: sShort.optional(),
-    descricao: s.optional(),
-    responsavel: s.optional(),
-    dataInventario: sShort.optional(),
+    id: sShortOpt,
+    codigo: sShortOpt,
+    descricao: sOpt,
+    responsavel: sOpt,
+    dataInventario: sShortOpt,
     status: z.enum(['aberto', 'fechado', 'cancelado']).optional(),
     contagemMobileHabilitada: z.boolean().optional(),
-    observacoes: s.optional(),
+    observacoes: sOpt,
     itens: optionalArray(inventarioItemSnapshotSchema),
 })
     .passthrough();
@@ -163,8 +167,8 @@ export const isoSnapshotPayloadSchema = z
     usuariosSistema: z.unknown().optional(),
     disciplinas: optionalArray(sShort),
     unidades: optionalArray(sShort),
-    versao: sShort.optional(),
-    dataAtualizacao: sShort.optional(),
+    versao: sShortOpt,
+    dataAtualizacao: sShortOpt,
 })
     .passthrough();
 /**

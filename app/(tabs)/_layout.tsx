@@ -1,12 +1,20 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { Tabs } from 'expo-router';
 import { tabLeaveGuardTabListeners } from '@/src/lib/tabLeaveGuardListeners';
+import { useOfflineSnapshotAutoFlush } from '@/src/lib/useOfflineSnapshotAutoFlush';
 import { useTheme } from '@/src/theme/ThemeContext';
+
+function TabsWithOfflineSync() {
+  useOfflineSnapshotAutoFlush();
+  return null;
+}
 
 export default function TabLayout() {
   const { colors } = useTheme();
   return (
-    <Tabs
+    <>
+      <TabsWithOfflineSync />
+      <Tabs
       screenOptions={{
         tabBarActiveTintColor: colors.accent,
         tabBarInactiveTintColor: colors.textMuted,
@@ -55,10 +63,10 @@ export default function TabLayout() {
         name="consulta"
         listeners={tabLeaveGuardTabListeners}
         options={{
-          title: 'Documentos',
-          tabBarLabel: 'Documentos',
+          title: 'Consulta',
+          tabBarLabel: 'Consulta',
           tabBarIcon: ({ color, size }) => (
-            <MaterialCommunityIcons name="file-document-multiple-outline" color={color} size={size ?? 22} />
+            <MaterialCommunityIcons name="magnify" color={color} size={size ?? 22} />
           ),
         }}
       />
@@ -75,5 +83,6 @@ export default function TabLayout() {
         }}
       />
     </Tabs>
+    </>
   );
 }

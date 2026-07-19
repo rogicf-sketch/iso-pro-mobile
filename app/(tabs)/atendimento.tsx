@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useFocusEffect } from 'expo-router';
 import { useNavigation } from '@react-navigation/native';
+import { CloudSyncStrip } from '@/src/components/mobile/CloudSyncStrip';
+import { AtendimentoOperacaoOverlay } from '@/src/components/mobile/AtendimentoOperacaoOverlay';
+import { ModuleScreenHeader } from '@/src/components/mobile/ModuleScreenHeader';
+import { PrimaryActionButton } from '@/src/components/mobile/PrimaryActionButton';
+import { SectionCard } from '@/src/components/mobile/SectionCard';
+import { StatPillRow } from '@/src/components/mobile/StatPillRow';
 import {
   ActivityIndicator,
   BackHandler,
@@ -17,14 +23,29 @@ import { appAlert } from '@/src/lib/appDialog';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { getAtendenteRegisto } from '@/src/lib/atendenteSessao';
 import { useDebouncedEffect } from '@/src/lib/useDebouncedEffect';
-import { fetchDefaultSnapshot } from '@/src/lib/snapshot';
-import { commitDefaultSnapshotWriteResilient as commitDefaultSnapshotWrite } from '@/src/lib/offlineSnapshotQueue';
+import {
+  fetchSnapshotSlices,
+  listDocumentosPendenciaMaterialFromCloud,
+  readDocumentoPlanejamentoFromCloud,
+  reservarNumeroAtendimentoFromCloud,
+} from '@/src/lib/snapshot';
+import {
+  buildAtendimentoIdempotencyKey,
+  getAtendimentoComandoQueueSize,
+  persistirAtendimentoOptimistic,
+  setAtendimentoCloudBaselineCursor,
+  ATENDIMENTO_CONFLICT_FINAL_MESSAGE,
+} from '@/src/lib/atendimentoComando';
+import { SNAPSHOT_CONFLICT_MESSAGE } from '@/src/lib/isoProSnapshot';
+import { SNAPSHOT_MOBILE_ATENDIMENTO_BOOT_KEYS } from '@/src/lib/snapshotSliceKeys';
+import { mergeAtendimentoPayloadPreservandoLocal } from '@/src/lib/mergeAtendimentoPayloadLocal';
 import { rotuloBotaoConfirmarGravacaoSnapshot } from '@/src/lib/snapshotWriteFeedback';
 import { useSnapshotRefreshOnAppActive } from '@/src/lib/useSnapshotRefreshOnAppActive';
 import { hasSupabaseConfig } from '@/src/lib/config';
 import {
   aplicarAtendimentoLote,
   aplicarAtendimentoPorCodigoBarras,
+  resolverIdDocumentoPlanejamento,
   encontrarMaterialPorCodigoOuBarras,
   extrairCodigoMaterialDeTextoLeitura,
   resolverMaterialParaBaixaPorCodigo,
@@ -32,17 +53,22 @@ import {
   descricaoNaLinhaPlanejamento,
   quantidadeAtendidaLinha,
   listarDocumentosComDemandaPendenteMaterial,
+  materialTemDemandaPendenteNoDocumento,
   montarHtmlReciboSessaoUnificada,
   montarTextoReciboSessaoUnificada,
   type LinhaSessaoAtendimento,
 } from '@/src/lib/registrarAtendimento';
+import { registerAtendimentoSessaoGate } from '@/src/lib/atendimentoSessaoGate';
 import {
   exemplosNumerosDocumentos,
   filtrarDocumentosPlanejamentoPorTexto,
   resolverBuscaDocumentoPorNumero,
 } from '@/src/lib/documentoBusca';
-import { formatarDataHoraLocal } from '@/src/lib/formatData';
-import { formatQuantidadeExibicao } from '@/src/lib/formatQuantidade';
+import { carregarDocumentosParaBuscaTexto } from '@/src/lib/documentoBuscaCloud';
+import { listDocumentosPendentesAtendimentoFromCloud } from '@/src/lib/escalaCloud';
+import { formatOperadorNetworkError } from '@/src/lib/formatOperadorNetworkError';
+import { mergeDocumentosPlanejamentoNoPayload } from '@/src/lib/prefetchDocumentosAtendimento';
+import { formatQuantidadeComUnidade, formatQuantidadeExibicao } from '@/src/lib/formatQuantidade';
 import {
   abrirWhatsAppComTexto,
   compartilharTexto,
@@ -51,8 +77,13 @@ import {
 import { resolverRecebedorColaborador } from '@/src/lib/recebedorColaborador';
 import { buildSaldoOperacionalParaAtendimento, codigoMaterialKey } from '@/src/lib/saldoMaterial';
 import { playScanBeep } from '@/src/lib/playScanBeep';
-import { registerAtendimentoSessaoGate } from '@/src/lib/atendimentoSessaoGate';
+import {
+  garantirAtendimentoSincronizadoNaNuvem,
+  resumoConfirmacaoSessaoNuvem,
+  validarReciboSessaoContraHistorico,
+} from '@/src/lib/atendimentoSincroniaConfiavel';
 import { buildAtendimentoStyles } from '@/src/theme/buildAtendimentoStyles';
+import { buildMobileShellStyles } from '@/src/theme/buildMobileShellStyles';
 import { useMobileUiPreferences } from '@/src/theme/MobileUiPreferencesContext';
 import { useTheme } from '@/src/theme/ThemeContext';
 import type {
@@ -76,20 +107,43 @@ function mesmoDocumentoReferencia(a: DocumentoPlanejamento | null, b: DocumentoP
   return String(a.id) === String(b.id);
 }
 
+const MAX_DESENHOS_EM_MEMORIA = 48;
+
+/** Evita manter 1000+ resumos de prefetch antigo — só desenhos em uso na sessão. */
+function podarDocumentosEmMemoria(
+  payload: IsoSnapshotPayload,
+  manterIds: ReadonlySet<string>,
+): IsoSnapshotPayload {
+  const docs = (payload.documentos ?? []) as DocumentoPlanejamento[];
+  if (docs.length <= MAX_DESENHOS_EM_MEMORIA) return payload;
+  const podados = docs.filter((d) => manterIds.has(String(d.id ?? '')));
+  return { ...payload, documentos: podados };
+}
+
+type PendenciaMaterialCache = {
+  codigo: string;
+  docs: { documento: DocumentoPlanejamento; restanteMaterial: number }[];
+};
+
 export default function AtendimentoScreen() {
   const navigation = useNavigation();
   const { colors } = useTheme();
   const { mostrarTextosAjudaModulos } = useMobileUiPreferences();
   const styles = useMemo(() => buildAtendimentoStyles(colors), [colors]);
+  const shell = useMemo(() => buildMobileShellStyles(colors), [colors]);
   const configured = useMemo(() => hasSupabaseConfig(), []);
   const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const [carregandoDesenhos, setCarregandoDesenhos] = useState(false);
+  const [pendenciaMaterialCache, setPendenciaMaterialCache] = useState<PendenciaMaterialCache | null>(null);
+  const pendenciaMaterialReqRef = useRef(0);
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [nuvemAt, setNuvemAt] = useState<string | null>(null);
   const [payload, setPayload] = useState<IsoSnapshotPayload | null>(null);
 
   const [buscaDoc, setBuscaDoc] = useState('');
   const [msgBusca, setMsgBusca] = useState<string | null>(null);
+  /** Busca de desenho na nuvem em curso — spinner no botão «Buscar documento». */
+  const [buscandoDoc, setBuscandoDoc] = useState(false);
   const [candidatosBuscaDoc, setCandidatosBuscaDoc] = useState<DocumentoPlanejamento[] | null>(null);
   const [doc, setDoc] = useState<DocumentoPlanejamento | null>(null);
   const [qtdLinha, setQtdLinha] = useState<Record<number, string>>({});
@@ -102,6 +156,9 @@ export default function AtendimentoScreen() {
   const [codigoBarras, setCodigoBarras] = useState('');
   const [qtdBarras, setQtdBarras] = useState('1');
   const [scannerOpen, setScannerOpen] = useState(false);
+  const [syncingComandos, setSyncingComandos] = useState(false);
+  const [finalizandoSessao, setFinalizandoSessao] = useState(false);
+  const [comandosPendentes, setComandosPendentes] = useState(0);
   const [camPermission, requestCamPermission] = useCameraPermissions();
   const scanCooldownRef = useRef(0);
   /** Último código de material usado no fluxo por scan — para limpar o desenho ao mudar de item. */
@@ -109,6 +166,12 @@ export default function AtendimentoScreen() {
   const sessaoAtendimentoRef = useRef<LinhaSessaoAtendimento[]>([]);
   /** Sessão atual: próximo registo (código ou desenho) reutiliza o mesmo ATD na nuvem até finalizar ou mudar recebedor. */
   const sessaoCodigoBarrasLoteRef = useRef<{ loteNumero: string; loteId: number } | null>(null);
+  const payloadRef = useRef<IsoSnapshotPayload | null>(null);
+  const docAbertoRef = useRef<DocumentoPlanejamento | null>(null);
+  const nuvemAtRef = useRef<string | null>(null);
+  const documentosPrefetchPendentesRef = useRef<DocumentoPlanejamento[]>([]);
+  const syncEmFilaRef = useRef(Promise.resolve());
+  const carregarNuvemEmCursoRef = useRef(false);
   const [sessaoAtendimentoItens, setSessaoAtendimentoItens] = useState<LinhaSessaoAtendimento[]>([]);
   const [comprovanteModal, setComprovanteModal] = useState<{
     texto: string;
@@ -116,15 +179,18 @@ export default function AtendimentoScreen() {
     onFechar?: () => void;
   } | null>(null);
 
-  useEffect(() => {
-    if (scannerOpen) scanCooldownRef.current = 0;
-  }, [scannerOpen]);
+  const operacaoOverlay = useMemo(() => {
+    if (finalizandoSessao) {
+      return {
+        visible: true,
+        titulo: 'A finalizar atendimento',
+        mensagem:
+          'A confirmar todas as baixas na nuvem antes do comprovante. Mantenha a ligação e aguarde…',
+      };
+    }
+    return { visible: false, titulo: '', mensagem: '' };
+  }, [finalizandoSessao]);
 
-  useEffect(() => {
-    sessaoAtendimentoRef.current = [];
-    sessaoCodigoBarrasLoteRef.current = null;
-    setSessaoAtendimentoItens([]);
-  }, [recebedor]);
 
   const limparSessaoAtendimentoLocal = useCallback(() => {
     sessaoAtendimentoRef.current = [];
@@ -195,6 +261,28 @@ export default function AtendimentoScreen() {
     return extrairCodigoMaterialDeTextoLeitura(t);
   }, [codigoBarras, payload]);
 
+  /** Unidade do material em foco (scan / código alvo) — exibida em todos os quadros da linha. */
+  const unidadeMaterialAlvo = useMemo(() => {
+    const uScan = String(materialDoScan?.unidade ?? '').trim();
+    if (uScan) return uScan;
+    if (!payload || !codigoAlvoPlanejamento) return '';
+    const mat = encontrarMaterialPorCodigoOuBarras(payload.materiais as Material[], codigoAlvoPlanejamento);
+    if (mat?.unidade) return String(mat.unidade).trim();
+    if (doc?.itens) {
+      for (const it of doc.itens) {
+        if (
+          codigoMaterialKey(codigoNaLinhaPlanejamento(it as DocumentoItemPlanejamento)) !==
+          codigoMaterialKey(codigoAlvoPlanejamento)
+        ) {
+          continue;
+        }
+        const u = String(it.unidade ?? '').trim();
+        if (u) return u;
+      }
+    }
+    return '';
+  }, [materialDoScan?.unidade, payload, codigoAlvoPlanejamento, doc?.itens]);
+
   /** Recebimentos − já atendido (+ ajustes) — igual ao I.S.O PRO desktop; necessário para permitir atendimento. */
   const saldoPorCodigo = useMemo(() => {
     if (!payload) return null;
@@ -203,8 +291,14 @@ export default function AtendimentoScreen() {
 
   const docsComPendenteMaterial = useMemo(() => {
     if (!payload || !codigoAlvoPlanejamento) return [];
-    return listarDocumentosComDemandaPendenteMaterial(payload, codigoAlvoPlanejamento);
-  }, [payload, codigoAlvoPlanejamento]);
+    const cod = codigoAlvoPlanejamento.trim();
+    if (pendenciaMaterialCache?.codigo === cod) {
+      return pendenciaMaterialCache.docs;
+    }
+    const docsNaMemoria = payload.documentos?.length ?? 0;
+    if (docsNaMemoria > MAX_DESENHOS_EM_MEMORIA) return [];
+    return listarDocumentosComDemandaPendenteMaterial(payload, cod);
+  }, [payload, codigoAlvoPlanejamento, pendenciaMaterialCache]);
 
   /** Vários desenhos com pendência para o código → lista de escolha (só desenhos onde dá baixa). */
   useEffect(() => {
@@ -239,7 +333,21 @@ export default function AtendimentoScreen() {
   const baseNuvemRecebedor =
     snapshotCarregado && Boolean(nuvemAt) && recebedorResolvido?.ok === true;
   /** Regra do sistema: toda baixa (linhas ou código) exige documento de referência aberto. */
-  const podeRegistarAtendimentoBase = baseNuvemRecebedor && docReferenciaOk;
+  const podeRegistarAtendimentoBase =
+    baseNuvemRecebedor && docReferenciaOk && !finalizandoSessao;
+
+  const resumoSyncSessao = useMemo(() => {
+    if (sessaoAtendimentoItens.length === 0 || !payload) return null;
+    const loteRef =
+      sessaoCodigoBarrasLoteRef.current ??
+      (sessaoAtendimentoItens[0]?.loteNumero
+        ? {
+            loteNumero: sessaoAtendimentoItens[0].loteNumero,
+            loteId: 0,
+          }
+        : null);
+    return resumoConfirmacaoSessaoNuvem(payload, sessaoAtendimentoItens, loteRef);
+  }, [payload, sessaoAtendimentoItens, syncingComandos, nuvemAt, comandosPendentes]);
 
   const saldoEstoqueMaterialBarras = useMemo(() => {
     if (!saldoPorCodigo) return null;
@@ -336,31 +444,210 @@ export default function AtendimentoScreen() {
     qtdBarrasNum <= saldoEstoqueMaterialBarras + 1e-9 &&
     (pendenteMaterialNoDocReferencia === null || qtdBarrasNum <= pendenteMaterialNoDocReferencia + 1e-9);
 
-  /** Atualiza snapshot sem limpar recebedor/documento em edição (uso ao abrir o ecrã e no botão). */
-  const carregarNuvem = useCallback(async () => {
+  useEffect(() => {
+    payloadRef.current = payload;
+  }, [payload]);
+
+  useEffect(() => {
+    docAbertoRef.current = doc;
+  }, [doc]);
+
+  useEffect(() => {
+    nuvemAtRef.current = nuvemAt;
+  }, [nuvemAt]);
+
+  /** Atualiza snapshot; com `preservarEstado` mantém desenhos lazy-loaded e baixas locais pendentes. */
+  const aplicarDocumentosPrefetchPendentes = useCallback((base: IsoSnapshotPayload | null): IsoSnapshotPayload | null => {
+    if (!base) return base;
+    const pending = documentosPrefetchPendentesRef.current;
+    if (!pending.length) return base;
+    documentosPrefetchPendentesRef.current = [];
+    return {
+      ...base,
+      documentos: mergeDocumentosPlanejamentoNoPayload([], pending),
+    };
+  }, []);
+
+  const mergeDocumentosNoPayload = useCallback((docs: DocumentoPlanejamento[]) => {
+    setPayload((prev) => {
+      if (!prev) {
+        documentosPrefetchPendentesRef.current = mergeDocumentosPlanejamentoNoPayload(
+          documentosPrefetchPendentesRef.current,
+          docs,
+        );
+        return prev;
+      }
+      return {
+        ...prev,
+        documentos: mergeDocumentosPlanejamentoNoPayload((prev.documentos ?? []) as DocumentoPlanejamento[], docs),
+      };
+    });
+  }, []);
+
+  const carregarNuvem = useCallback(async (opts?: { preservarEstado?: boolean }) => {
+    if (carregarNuvemEmCursoRef.current) return;
+    const tinhaPayload = Boolean(payloadRef.current);
+    const preservar = opts?.preservarEstado ?? tinhaPayload;
+    carregarNuvemEmCursoRef.current = true;
     setLoadErr(null);
     setLoading(true);
     try {
-      const { payload: p, updatedAt, error } = await fetchDefaultSnapshot();
+      const { payload: p, updatedAt, error } = await fetchSnapshotSlices(SNAPSHOT_MOBILE_ATENDIMENTO_BOOT_KEYS);
       if (error) {
-        setLoadErr(error);
-        setPayload(null);
+        setLoadErr(
+          formatOperadorNetworkError(error, { contexto: 'carregar', tinhaDadosLocais: tinhaPayload }),
+        );
+        if (!preservar) {
+          setPayload(null);
+          payloadRef.current = null;
+        }
         return;
       }
-      setPayload(p ? deepClone(p) : null);
+      setPayload((prev) => {
+        const nuvem = p ? deepClone(p) : null;
+        let next: IsoSnapshotPayload | null;
+        if (!preservar || !prev || !nuvem) {
+          next = nuvem;
+        } else {
+          next = mergeAtendimentoPayloadPreservandoLocal(nuvem, prev);
+        }
+        let resolved = aplicarDocumentosPrefetchPendentes(next);
+        if (resolved) {
+          const manter = new Set<string>();
+          const docAberto = docAbertoRef.current;
+          if (docAberto?.id) manter.add(String(docAberto.id));
+          for (const d of (resolved.documentos ?? []) as DocumentoPlanejamento[]) {
+            if ((d.itens?.length ?? 0) > 0) manter.add(String(d.id ?? ''));
+          }
+          resolved = podarDocumentosEmMemoria(resolved, manter);
+        }
+        payloadRef.current = resolved;
+        return resolved;
+      });
       setNuvemAt(updatedAt);
+      nuvemAtRef.current = updatedAt;
+      setAtendimentoCloudBaselineCursor(updatedAt);
+      const pending = await getAtendimentoComandoQueueSize();
+      setComandosPendentes(pending);
+      try {
+        const pendDocs = await listDocumentosPendentesAtendimentoFromCloud({ limit: 200 });
+        if (!pendDocs.missing && pendDocs.documentos.length > 0) {
+          mergeDocumentosNoPayload(pendDocs.documentos as unknown as DocumentoPlanejamento[]);
+        }
+      } catch {
+        /* boot continua; busca por texto usa RPCs */
+      }
     } finally {
+      carregarNuvemEmCursoRef.current = false;
       setLoading(false);
     }
-  }, []);
+  }, [aplicarDocumentosPrefetchPendentes, mergeDocumentosNoPayload]);
+
+  const executarSyncAtendimento = useCallback(
+    async (
+      payloadAntes: IsoSnapshotPayload,
+      payloadDepois: IsoSnapshotPayload,
+      idempotencyKey: string,
+    ) => {
+      setSyncingComandos(true);
+      try {
+        const baseline = nuvemAtRef.current;
+        if (!baseline) return;
+        const result = await persistirAtendimentoOptimistic({
+          payloadAtual: payloadAntes,
+          payloadNext: payloadDepois,
+          baselineUpdatedAt: baseline,
+          idempotencyKey,
+        });
+        if (result.error) {
+          if (result.conflict) {
+            const msg =
+              result.error === SNAPSHOT_CONFLICT_MESSAGE || result.error === ATENDIMENTO_CONFLICT_FINAL_MESSAGE
+                ? result.error
+                : `${SNAPSHOT_CONFLICT_MESSAGE}\n\n${result.error}`;
+            appAlert(
+              'Conflito — recarregue a lista',
+              `${msg}\n\nOs registos permanecem nesta sessão neste telemóvel. Toque em «Carregar dados da nuvem», aguarde a faixa estabilizar e tente finalizar de novo.`,
+            );
+            void carregarNuvem({ preservarEstado: true });
+          } else {
+            appAlert(
+              'Sincronização',
+              formatOperadorNetworkError(result.error, { contexto: 'sincronizar' }),
+            );
+          }
+          return;
+        }
+        setPayload(payloadDepois);
+        payloadRef.current = payloadDepois;
+        if (result.updatedAt) {
+          setNuvemAt(result.updatedAt);
+          nuvemAtRef.current = result.updatedAt;
+          setAtendimentoCloudBaselineCursor(result.updatedAt);
+        }
+        const pending = await getAtendimentoComandoQueueSize();
+        setComandosPendentes(pending);
+        setPendenciaMaterialCache(null);
+      } finally {
+        setSyncingComandos(false);
+      }
+    },
+    [carregarNuvem],
+  );
+
+  const sincronizarAtendimentoEmBackground = useCallback(
+    (payloadAntes: IsoSnapshotPayload, payloadDepois: IsoSnapshotPayload, idempotencyKey: string) => {
+      syncEmFilaRef.current = syncEmFilaRef.current
+        .then(() => executarSyncAtendimento(payloadAntes, payloadDepois, idempotencyKey))
+        .catch(() => undefined);
+      void syncEmFilaRef.current;
+    },
+    [executarSyncAtendimento],
+  );
+
+  const refreshNuvemEmSegundoPlano = useCallback(() => {
+    if (carregarNuvemEmCursoRef.current || finalizandoSessao) return;
+    void carregarNuvem({ preservarEstado: true });
+  }, [carregarNuvem, finalizandoSessao]);
 
   useFocusEffect(
     useCallback(() => {
+      if (payloadRef.current) {
+        setPayload((prev) => {
+          if (!prev) return prev;
+          const manter = new Set<string>();
+          const docAberto = docAbertoRef.current;
+          if (docAberto?.id) manter.add(String(docAberto.id));
+          for (const d of (prev.documentos ?? []) as DocumentoPlanejamento[]) {
+            if ((d.itens?.length ?? 0) > 0) manter.add(String(d.id ?? ''));
+          }
+          const podado = podarDocumentosEmMemoria(prev, manter);
+          if (podado.documentos?.length === prev.documentos?.length) return prev;
+          payloadRef.current = podado;
+          return podado;
+        });
+        return;
+      }
       void carregarNuvem();
     }, [carregarNuvem]),
   );
 
-  useSnapshotRefreshOnAppActive(carregarNuvem);
+  useSnapshotRefreshOnAppActive(refreshNuvemEmSegundoPlano, 2500);
+
+  /** Mantém o desenho aberto alinhado ao payload após merge/reload. */
+  useEffect(() => {
+    if (!doc?.id || !payload?.documentos?.length) return;
+    const id = String(doc.id);
+    const atualizado = (payload.documentos as DocumentoPlanejamento[]).find((d) => String(d.id ?? '') === id);
+    if (!atualizado) return;
+    setDoc((prev) => {
+      if (!prev || String(prev.id ?? '') !== id) return prev;
+      const prevJson = JSON.stringify(prev.itens ?? []);
+      const nextJson = JSON.stringify(atualizado.itens ?? []);
+      if (prevJson === nextJson) return prev;
+      return deepClone(atualizado);
+    });
+  }, [payload?.documentos, doc?.id]);
 
   /**
    * Com código identificado: só desenhos com **pendência** para dar baixa (igual critério da lista «Onde há pendência»).
@@ -385,9 +672,10 @@ export default function AtendimentoScreen() {
 
   const docFiltradosParaExibir = useMemo(() => {
     if (!doc) return docFiltradosRapido;
+    if (codigoAlvoPlanejamento) return docFiltradosRapido;
     const hit = docFiltradosRapido.find((d) => mesmoDocumentoReferencia(doc, d));
     return hit ? [hit] : [doc];
-  }, [docFiltradosRapido, doc]);
+  }, [docFiltradosRapido, doc, codigoAlvoPlanejamento]);
 
   const listaTodosDesenhosParaExibir = useMemo(() => {
     const all = (payload?.documentos ?? []) as DocumentoPlanejamento[];
@@ -398,8 +686,28 @@ export default function AtendimentoScreen() {
 
   const docsPendenteParaExibir = useMemo(() => {
     if (!doc) return docsComPendenteMaterial;
+    const docAindaPendente = docsComPendenteMaterial.some(({ documento: d }) =>
+      mesmoDocumentoReferencia(doc, d),
+    );
+    if (!docAindaPendente) return docsComPendenteMaterial;
     return docsComPendenteMaterial.filter(({ documento: d }) => mesmoDocumentoReferencia(doc, d));
   }, [docsComPendenteMaterial, doc]);
+
+  /** Com código scaneado: não manter desenho aberto se já não há pendência para esse material. */
+  useEffect(() => {
+    if (!codigoAlvoPlanejamento || !doc || !payload) return;
+    const aindaPendente = docsComPendenteMaterial.some(({ documento: d }) =>
+      mesmoDocumentoReferencia(doc, d),
+    );
+    if (!aindaPendente) {
+      setDoc(null);
+      setBuscaDoc('');
+      setQtdLinha({});
+      if (docsComPendenteMaterial.length > 0) {
+        setMostrarListaDocsMaterial(true);
+      }
+    }
+  }, [codigoAlvoPlanejamento, doc, payload, docsComPendenteMaterial]);
 
   const candidatosBuscaDocParaExibir = useMemo(() => {
     if (!candidatosBuscaDoc?.length) return candidatosBuscaDoc;
@@ -408,6 +716,42 @@ export default function AtendimentoScreen() {
     return hit ? [hit] : candidatosBuscaDoc;
   }, [candidatosBuscaDoc, doc]);
 
+  const documentoPermitidoParaCodigoScaneado = useCallback(
+    (d: DocumentoPlanejamento) => {
+      if (!codigoAlvoPlanejamento) return true;
+      return docsComPendenteMaterial.some(({ documento: x }) => mesmoDocumentoReferencia(x, d));
+    },
+    [codigoAlvoPlanejamento, docsComPendenteMaterial],
+  );
+
+  /** Abre documento e, se veio sem itens (list_page/resumo), hidrata da nuvem. */
+  const abrirDocumentoAtendimento = useCallback(
+    (d: DocumentoPlanejamento, opts?: { mensagem?: string | null }) => {
+      setDoc(deepClone(d));
+      setQtdLinha({});
+      setCandidatosBuscaDoc(null);
+      if (opts && 'mensagem' in opts) setMsgBusca(opts.mensagem ?? null);
+      else setMsgBusca(null);
+      void (async () => {
+        if ((d.itens?.length ?? 0) > 0) return;
+        try {
+          const cloud = await readDocumentoPlanejamentoFromCloud({
+            documentoId: d.id,
+            numero: d.numero,
+            revisao: d.revisao,
+          });
+          if (!cloud.documento) return;
+          const docFull = cloud.documento as unknown as DocumentoPlanejamento;
+          mergeDocumentosNoPayload([docFull]);
+          setDoc(deepClone(docFull));
+        } catch {
+          /* mantém versão parcial */
+        }
+      })();
+    },
+    [mergeDocumentosNoPayload],
+  );
+
   /** Abre o desenho só quando a busca «inteligente» encontra uma correspondência única (evita mensagens a cada tecla). */
   const tentarAutoSelecionarDocumento = useCallback(() => {
     if (!payload?.documentos?.length) return;
@@ -415,26 +759,23 @@ export default function AtendimentoScreen() {
     if (raw.length < 1) return;
     const res = resolverBuscaDocumentoPorNumero(payload.documentos as DocumentoPlanejamento[], buscaDoc);
     if (res.kind === 'one') {
-      setDoc(deepClone(res.doc));
-      setMsgBusca(null);
-      setCandidatosBuscaDoc(null);
-      setQtdLinha({});
+      if (!documentoPermitidoParaCodigoScaneado(res.doc)) return;
+      abrirDocumentoAtendimento(res.doc);
       return;
     }
     if (res.kind === 'sameNumeroVarios') {
-      setDoc(deepClone(res.docs[0]));
-      setMsgBusca(null);
-      setCandidatosBuscaDoc(null);
-      setQtdLinha({});
+      const escolhido = res.docs.find((d) => documentoPermitidoParaCodigoScaneado(d));
+      if (!escolhido) return;
+      abrirDocumentoAtendimento(escolhido);
     }
-  }, [buscaDoc, payload]);
+  }, [buscaDoc, payload, documentoPermitidoParaCodigoScaneado, abrirDocumentoAtendimento]);
 
   const buscarDocumento = useCallback(() => {
     setMsgBusca(null);
     setDoc(null);
     setQtdLinha({});
     setCandidatosBuscaDoc(null);
-    if (!payload?.documentos?.length) {
+    if (!payload) {
       setMsgBusca('Carregue os dados da nuvem primeiro.');
       return;
     }
@@ -443,29 +784,71 @@ export default function AtendimentoScreen() {
       setMsgBusca('Informe o número do documento (ex.: AQ-3-BT-232-CS10-IQ).');
       return;
     }
-    const res = resolverBuscaDocumentoPorNumero(payload.documentos as DocumentoPlanejamento[], buscaDoc);
-    if (res.kind === 'none') {
-      const ex = exemplosNumerosDocumentos(payload.documentos as DocumentoPlanejamento[], 6);
-      setMsgBusca(
-        ex.length
-          ? `Nenhum desenho combina com «${buscaDoc.trim()}». Exemplos no telemóvel: ${ex.join(' · ')}. Confira o formato (com ou sem traço) ou continue a digitar.`
-          : 'Nenhum documento encontrado.',
-      );
-      return;
-    }
-    if (res.kind === 'one') {
-      setDoc(deepClone(res.doc));
-      setMsgBusca(null);
-      return;
-    }
-    if (res.kind === 'sameNumeroVarios') {
-      setMsgBusca(`${res.docs.length} documentos com o mesmo número — abrindo o primeiro.`);
-      setDoc(deepClone(res.docs[0]));
-      return;
-    }
-    setCandidatosBuscaDoc(res.docs);
-    setMsgBusca(`${res.docs.length} desenhos correspondem a «${buscaDoc.trim()}» — toque numa linha para abrir.`);
-  }, [buscaDoc, payload]);
+    setBuscandoDoc(true);
+    void (async () => {
+      let documentos: DocumentoPlanejamento[];
+      try {
+        documentos = await carregarDocumentosParaBuscaTexto({
+          payload,
+          buscaTexto: buscaDoc,
+          mergeDocumentos: mergeDocumentosNoPayload,
+        });
+      } catch {
+        setMsgBusca('Não foi possível ler o desenho na nuvem. Verifique a ligação.');
+        return;
+      }
+      if (!documentos.length) {
+        setMsgBusca('Desenho não encontrado na nuvem. Confira o número ou envie o planejamento do PC.');
+        return;
+      }
+      const res = resolverBuscaDocumentoPorNumero(documentos, buscaDoc);
+      if (res.kind === 'none') {
+        const ex = exemplosNumerosDocumentos(documentos, 6);
+        setMsgBusca(
+          ex.length
+            ? `Nenhum desenho combina com «${buscaDoc.trim()}». Exemplos carregados: ${ex.join(' · ')}.`
+            : 'Nenhum documento encontrado.',
+        );
+        return;
+      }
+      if (res.kind === 'one') {
+        if (!documentoPermitidoParaCodigoScaneado(res.doc)) {
+          setMsgBusca(
+            codigoAlvoPlanejamento
+              ? `O desenho «${String(res.doc.numero ?? '—')}» já não tem retirada pendente para ${codigoAlvoPlanejamento}.`
+              : 'Documento encontrado.',
+          );
+          return;
+        }
+        abrirDocumentoAtendimento(res.doc);
+        return;
+      }
+      if (res.kind === 'sameNumeroVarios') {
+        const escolhido = res.docs.find((d) => documentoPermitidoParaCodigoScaneado(d));
+        if (!escolhido) {
+          setMsgBusca(
+            codigoAlvoPlanejamento
+              ? `Nenhuma revisão deste desenho tem retirada pendente para ${codigoAlvoPlanejamento}.`
+              : `${res.docs.length} documentos com o mesmo número.`,
+          );
+          return;
+        }
+        abrirDocumentoAtendimento(escolhido, {
+          mensagem: `${res.docs.length} documentos com o mesmo número — abrindo o que tem pendência.`,
+        });
+        return;
+      }
+      setCandidatosBuscaDoc(res.docs);
+      setMsgBusca(`${res.docs.length} desenhos correspondem a «${buscaDoc.trim()}» — toque numa linha para abrir.`);
+    })().finally(() => setBuscandoDoc(false));
+  }, [
+    buscaDoc,
+    payload,
+    codigoAlvoPlanejamento,
+    documentoPermitidoParaCodigoScaneado,
+    mergeDocumentosNoPayload,
+    abrirDocumentoAtendimento,
+  ]);
 
   /** Após uma pausa curta, tenta abrir o único desenho que coincide com a busca inteligente. */
   useDebouncedEffect(
@@ -513,67 +896,113 @@ export default function AtendimentoScreen() {
 
   const finalizarSessaoAtendimentoEPartilhar = useCallback(
     (opts?: { skipConfirm?: boolean }) => {
-      if (!payload) {
-        appAlert('Atendimento', 'Carregue os dados da nuvem primeiro.');
-        return;
-      }
-      if (!nuvemAt) {
-        appAlert(
-          'Atendimento',
-          'É preciso ter o snapshot da nuvem carregado (data do snapshot em cima). Toque em «Carregar dados da nuvem».',
-        );
-        return;
-      }
-      const recebRes = resolverRecebedorColaborador(recebedor, payload.colaboradores as Colaborador[]);
-      if (!recebRes.ok) {
-        appAlert('Recebedor', recebRes.motivo);
-        return;
-      }
-      const recebCol = recebRes.colaborador;
-      const receb = recebRes.nomeOficial;
-      const cols = (payload.colaboradores ?? []) as Colaborador[];
-      const { nome: nomeAt, matricula: matAt, funcao: funAt } = getAtendenteRegisto(cols);
-      const linhas = sessaoAtendimentoRef.current;
-      if (linhas.length === 0) return;
+      const executar = async () => {
+        if (!payload) {
+          appAlert('Atendimento', 'Carregue os dados da nuvem primeiro.');
+          return;
+        }
+        if (!nuvemAt) {
+          appAlert(
+            'Atendimento',
+            'É preciso ter o snapshot da nuvem carregado (data do snapshot em cima). Toque em «Carregar dados da nuvem».',
+          );
+          return;
+        }
+        const recebRes = resolverRecebedorColaborador(recebedor, payload.colaboradores as Colaborador[]);
+        if (!recebRes.ok) {
+          appAlert('Recebedor', recebRes.motivo);
+          return;
+        }
+        const recebCol = recebRes.colaborador;
+        const receb = recebRes.nomeOficial;
+        const cols = (payload.colaboradores ?? []) as Colaborador[];
+        const { nome: nomeAt, matricula: matAt, funcao: funAt } = getAtendenteRegisto(cols);
+        const linhasSessao = sessaoAtendimentoRef.current;
+        if (linhasSessao.length === 0) return;
+        const loteRef = sessaoCodigoBarrasLoteRef.current;
 
-      const abrirRecibo = () => {
-        const ctx = {
-          documentoReferencia: doc,
-          configuracoesSistema: payload?.configuracoesSistema,
-          identificacaoAssinaturas: {
-            atendenteFuncao: funAt,
-            recebedorMatricula: String(recebCol.matricula ?? '').trim() || undefined,
-            recebedorFuncao: String(recebCol.funcao ?? '').trim() || undefined,
-          },
-        };
-        const txt = montarTextoReciboSessaoUnificada(linhas, nomeAt, receb, matAt, ctx);
-        const htmlImpressao = montarHtmlReciboSessaoUnificada(linhas, nomeAt, receb, matAt, ctx);
-        setComprovanteModal({
-          texto: txt,
-          htmlImpressao,
-          onFechar: () => {
-            sessaoAtendimentoRef.current = [];
-            sessaoCodigoBarrasLoteRef.current = null;
-            setSessaoAtendimentoItens([]);
-          },
-        });
+        setFinalizandoSessao(true);
+        try {
+          const sync = await garantirAtendimentoSincronizadoNaNuvem({
+            payloadLocal: payloadRef.current ?? payload,
+            loteRef,
+            linhasSessao,
+          });
+          if (!sync.ok) {
+            appAlert(
+              'Nuvem incompleta',
+              `${sync.error}\n\nO recibo só pode ser emitido quando **todas** as baixas estiverem confirmadas na nuvem (igual ao PC).`,
+            );
+            return;
+          }
+          if (sync.payloadHistorico) {
+            setPayload((prev) => {
+              const merged = mergeAtendimentoPayloadPreservandoLocal(sync.payloadHistorico!, prev ?? sync.payloadHistorico!);
+              payloadRef.current = merged;
+              return merged;
+            });
+          }
+          if (sync.updatedAt) {
+            setNuvemAt(sync.updatedAt);
+            nuvemAtRef.current = sync.updatedAt;
+          }
+          const pending = await getAtendimentoComandoQueueSize();
+          setComandosPendentes(pending);
+
+          const payloadValidacao = payloadRef.current ?? sync.payloadHistorico ?? payload;
+          const validacao = validarReciboSessaoContraHistorico(payloadValidacao, linhasSessao, loteRef);
+          if (!validacao.ok) {
+            appAlert(
+              'Dados não conferem',
+              `${validacao.motivo}\n\nSessão neste telemóvel: ${validacao.itensSessao} item(ns).\nNa nuvem: ${validacao.itensNuvem} item(ns).\n\nToque em «Carregar dados da nuvem» e aguarde a sincronização antes de finalizar.`,
+            );
+            return;
+          }
+
+          const linhas = validacao.linhasRecibo;
+          const qtdItensRecibo = validacao.itensNuvem;
+          const ctx = {
+            documentoReferencia: doc,
+            configuracoesSistema: payloadValidacao?.configuracoesSistema,
+            identificacaoAssinaturas: {
+              atendenteFuncao: funAt,
+              recebedorMatricula: String(recebCol.matricula ?? '').trim() || undefined,
+              recebedorFuncao: String(recebCol.funcao ?? '').trim() || undefined,
+            },
+          };
+          const txt = montarTextoReciboSessaoUnificada(linhas, nomeAt, receb, matAt, ctx);
+          const htmlImpressao = montarHtmlReciboSessaoUnificada(linhas, nomeAt, receb, matAt, ctx);
+          setComprovanteModal({
+            texto: txt,
+            htmlImpressao,
+            onFechar: () => {
+              sessaoAtendimentoRef.current = [];
+              sessaoCodigoBarrasLoteRef.current = null;
+              setSessaoAtendimentoItens([]);
+            },
+          });
+        } finally {
+          setFinalizandoSessao(false);
+        }
       };
 
       if (opts?.skipConfirm) {
-        abrirRecibo();
+        void executar();
         return;
       }
 
+      const linhasSessao = sessaoAtendimentoRef.current;
+      const qtdOps = linhasSessao.length;
       appAlert(
         'Confirmar',
-        `Finalizar sessão e gerar um comprovante único?\n\nDestinatário: ${receb}\nOperações nesta sessão: ${linhas.length}\n\nSe algo estiver errado, toque em Cancelar.`,
+        `Finalizar sessão e gerar comprovante?\n\nDestinatário: ${recebedorResolvido?.ok ? recebedorResolvido.nomeOficial : recebedor.trim()}\nOperações: ${qtdOps}\n\nO sistema vai **confirmar na nuvem** antes de abrir o recibo — mobile e PC ficam iguais.\n\nMantenha ligação até concluir.`,
         [
           { text: 'Cancelar', style: 'cancel' },
-          { text: 'Sim', onPress: abrirRecibo },
+          { text: 'Confirmar e sincronizar', onPress: () => void executar() },
         ],
       );
     },
-    [recebedor, nuvemAt, payload, doc],
+    [recebedor, recebedorResolvido, nuvemAt, payload, doc],
   );
 
   const fecharComprovanteModal = useCallback(() => {
@@ -582,6 +1011,34 @@ export default function AtendimentoScreen() {
       return null;
     });
   }, []);
+
+  const obterReservaProtocoloNovaSessao = useCallback(async (): Promise<{
+    loteNumero: string;
+    loteId: number;
+  } | null> => {
+    if (sessaoCodigoBarrasLoteRef.current || !nuvemAt) return null;
+    try {
+      const cloud = await reservarNumeroAtendimentoFromCloud(nuvemAt);
+      if (cloud.ok) {
+        setNuvemAt(cloud.updatedAt);
+        setPayload((p) =>
+          p
+            ? {
+                ...p,
+                configuracoesSistema: {
+                  ...(p.configuracoesSistema ?? {}),
+                  sequenciaAtendimento: cloud.sequencia,
+                },
+              }
+            : p,
+        );
+        return { loteNumero: cloud.numero, loteId: Date.now() + Math.floor(Math.random() * 1000) };
+      }
+    } catch {
+      /* reserva local em aplicarAtendimento* */
+    }
+    return null;
+  }, [nuvemAt]);
 
   const registarPorCodigo = useCallback(async () => {
     if (!payload) {
@@ -622,9 +1079,21 @@ export default function AtendimentoScreen() {
       recebedorMatricula: String(recebRes.colaborador.matricula ?? '').trim() || undefined,
       recebedorFuncao: String(recebRes.colaborador.funcao ?? '').trim() || undefined,
     };
-    const res = aplicarAtendimentoPorCodigoBarras(payload, cod, q, nomeAt, receb, matAt, continuacao, {
-      apenasDocumentoId: doc?.id ?? null,
+    const docId = resolverIdDocumentoPlanejamento(payload, doc);
+    if (!docId) {
+      appAlert(
+        'Documento de referência',
+        'Abra um desenho válido no planejamento antes de dar baixa (busque pelo número e confirme).',
+      );
+      return;
+    }
+    const reservaInicial = continuacao ? null : await obterReservaProtocoloNovaSessao();
+    const basePayload = payloadRef.current ?? payload;
+    const res = aplicarAtendimentoPorCodigoBarras(basePayload, cod, q, nomeAt, receb, matAt, continuacao, {
+      apenasDocumentoId: docId,
+      exigirDocumentoReferencia: true,
       identificacaoComplementar: identHist,
+      reservaInicial,
     });
     if (!res.ok) {
       appAlert('Atendimento', res.erro);
@@ -648,115 +1117,70 @@ export default function AtendimentoScreen() {
           text: rotuloBotaoConfirmarGravacaoSnapshot(),
           onPress: () => {
             void (async () => {
-              setSaving(true);
-              try {
-                const result = await commitDefaultSnapshotWrite(async () => {
-                  const { payload: fresh, updatedAt, error } = await fetchDefaultSnapshot();
-                  if (error) {
-                    throw new Error(error);
-                  }
-                  if (!fresh) {
-                    throw new Error('Snapshot indisponível. Carregue a nuvem e tente novamente.');
-                  }
-                  const aplicado = aplicarAtendimentoPorCodigoBarras(
-                    fresh,
-                    cod,
-                    q,
-                    nomeAt,
-                    receb,
-                    matAt,
-                    continuacao,
-                    {
-                      apenasDocumentoId: doc?.id ?? null,
-                      identificacaoComplementar: identHist,
-                    },
-                  );
-                  if (!aplicado.ok) {
-                    throw new Error(aplicado.erro);
-                  }
-                  return { nextPayload: aplicado.payload, baselineUpdatedAt: updatedAt };
-                });
-                if (result.error) {
-                  appAlert(result.conflict ? 'Conflito de dados' : 'Supabase', result.error);
-                  if (result.conflict) {
-                    void carregarNuvem();
-                  }
-                  return;
-                }
-                const aplicadoLocal = aplicarAtendimentoPorCodigoBarras(
-                  payload!,
-                  cod,
-                  q,
-                  nomeAt,
-                  receb,
-                  matAt,
-                  continuacao,
-                  {
-                    apenasDocumentoId: doc?.id ?? null,
-                    identificacaoComplementar: identHist,
-                  },
-                );
-                if (aplicadoLocal.ok) {
-                  setPayload(aplicadoLocal.payload);
-                }
-                if (result.updatedAt) {
-                  setNuvemAt(result.updatedAt);
-                }
-                if (!continuacao) {
-                  sessaoCodigoBarrasLoteRef.current = { loteNumero: res.loteNumero, loteId: res.loteId };
-                }
-                const linha: LinhaSessaoAtendimento = {
-                  tipo: 'codigo_barras',
-                  loteNumero: res.loteNumero,
-                  material: res.material,
-                  atendidoTotal: res.atendidoTotal,
-                  documentoPlanejamento: doc
-                    ? {
-                        numero: String(doc.numero ?? ''),
-                        revisao: String(doc.revisao ?? ''),
-                        descricao: String(doc.descricao ?? ''),
-                        responsavel: String(doc.responsavel ?? '').trim() || undefined,
-                      }
-                    : null,
-                };
-                const nextSessao = [...sessaoAtendimentoRef.current, linha];
-                sessaoAtendimentoRef.current = nextSessao;
-                setSessaoAtendimentoItens(nextSessao);
-                setCodigoBarras('');
-                setQtdBarras('1');
-                prevCodigoAlvoPlanejamentoRef.current = null;
-                setDoc(null);
-                setBuscaDoc('');
-                setMsgBusca(null);
-                setCandidatosBuscaDoc(null);
-                setMostrarListaDocsMaterial(false);
-                const produtoLinha =
-                  String(res.material.descricao ?? '').trim() || matCod;
-                const unMat = String(res.material.unidade ?? '').trim();
-                const qLinha = formatQuantidadeExibicao(res.atendidoTotal);
-                const syncHintCodigo = result.queued
-                  ? '\n\nGuardado neste aparelho (pendente de sincronizacao com a nuvem).'
-                  : '\n\nGravado na nuvem.';
-                appAlert(
-                  'Código registrado',
-                  `Deseja continuar a registar mais materiais neste atendimento ou finalizar?\n\nProduto: ${produtoLinha}\nQuantidade: ${qLinha}${unMat ? ` ${unMat}` : ''}\nProtocolo: ${res.loteNumero}${syncHintCodigo}${continuacao ? '\n\n(mesmo protocolo — comprovante único ao finalizar)' : ''}`,
-                  [
-                    { text: 'Continuar', style: 'cancel' },
-                    {
-                      text: 'Finalizar atendimento',
-                      onPress: () => finalizarSessaoAtendimentoEPartilhar({ skipConfirm: true }),
-                    },
-                  ],
-                );
-              } finally {
-                setSaving(false);
+              if (!payload || !nuvemAt) {
+                appAlert('Atendimento', 'Carregue o snapshot da nuvem antes de registar.');
+                return;
               }
+              const idempotencyKey = buildAtendimentoIdempotencyKey({
+                loteId: res.loteId,
+                loteNumero: res.loteNumero,
+                documentoId: docId,
+                codigoMaterial: matCod,
+                quantidade: q,
+              });
+              const payloadAntesSync = basePayload;
+              setPayload(res.payload);
+              payloadRef.current = res.payload;
+              if (!continuacao) {
+                sessaoCodigoBarrasLoteRef.current = { loteNumero: res.loteNumero, loteId: res.loteId };
+              }
+              const linha: LinhaSessaoAtendimento = {
+                tipo: 'codigo_barras',
+                loteNumero: res.loteNumero,
+                material: res.material,
+                atendidoTotal: res.atendidoTotal,
+                documentosGravados: res.documentosGravados,
+                documentoPlanejamento: doc
+                  ? {
+                      numero: String(doc.numero ?? ''),
+                      revisao: String(doc.revisao ?? ''),
+                      descricao: String(doc.descricao ?? ''),
+                      responsavel: String(doc.responsavel ?? '').trim() || undefined,
+                    }
+                  : null,
+              };
+              const nextSessao = [...sessaoAtendimentoRef.current, linha];
+              sessaoAtendimentoRef.current = nextSessao;
+              setSessaoAtendimentoItens(nextSessao);
+              setCodigoBarras('');
+              setQtdBarras('1');
+              prevCodigoAlvoPlanejamentoRef.current = null;
+              setDoc(null);
+              setBuscaDoc('');
+              setMsgBusca(null);
+              setCandidatosBuscaDoc(null);
+              setMostrarListaDocsMaterial(false);
+              sincronizarAtendimentoEmBackground(payloadAntesSync, res.payload, idempotencyKey);
+              const produtoLinha = String(res.material.descricao ?? '').trim() || matCod;
+              const unMat = String(res.material.unidade ?? '').trim();
+              const qLinha = formatQuantidadeExibicao(res.atendidoTotal);
+              appAlert(
+                'Código registrado',
+                `Deseja continuar a registar mais materiais neste atendimento ou finalizar?\n\nProduto: ${produtoLinha}\nQuantidade: ${qLinha}${unMat ? ` ${unMat}` : ''}\nProtocolo: ${res.loteNumero}${continuacao ? '\n(mesmo protocolo — comprovante único ao finalizar)' : ''}\n\nSessão gravada neste aparelho.\n\nAo finalizar, o app **confirma na nuvem** antes de abrir o recibo.`,
+                [
+                  { text: 'Continuar', style: 'cancel' },
+                  {
+                    text: 'Finalizar (confirmar nuvem)',
+                    onPress: () => finalizarSessaoAtendimentoEPartilhar({ skipConfirm: true }),
+                  },
+                ],
+              );
             })();
           },
         },
       ],
     );
-  }, [carregarNuvem, codigoBarras, doc, finalizarSessaoAtendimentoEPartilhar, nuvemAt, payload, qtdBarras, recebedor]);
+  }, [carregarNuvem, codigoBarras, doc, finalizarSessaoAtendimentoEPartilhar, nuvemAt, obterReservaProtocoloNovaSessao, payload, qtdBarras, recebedor, sincronizarAtendimentoEmBackground]);
 
   const registar = useCallback(async () => {
     if (!doc || !payload) return;
@@ -782,7 +1206,9 @@ export default function AtendimentoScreen() {
       recebedorMatricula: String(recebRes.colaborador.matricula ?? '').trim() || undefined,
       recebedorFuncao: String(recebRes.colaborador.funcao ?? '').trim() || undefined,
     };
-    const res = aplicarAtendimentoLote(payload, doc.id, qtds, nomeAt, receb, matAt, continuacao, identHist);
+    const reservaInicial = continuacao ? null : await obterReservaProtocoloNovaSessao();
+    const basePayload = payloadRef.current ?? payload;
+    const res = aplicarAtendimentoLote(basePayload, doc.id, qtds, nomeAt, receb, matAt, continuacao, identHist, reservaInicial);
     if (!res.ok) {
       appAlert('Atendimento', res.erro);
       return;
@@ -797,68 +1223,62 @@ export default function AtendimentoScreen() {
           text: rotuloBotaoConfirmarGravacaoSnapshot(),
           onPress: () => {
             void (async () => {
-              setSaving(true);
-              try {
-                const docParaRecibo = deepClone(doc);
-                const qtdsCapturadas = { ...qtds };
-                const result = await commitDefaultSnapshotWrite(async () => {
-                  const { payload: fresh, updatedAt, error } = await fetchDefaultSnapshot();
-                  if (error) {
-                    throw new Error(error);
-                  }
-                  if (!fresh) {
-                    throw new Error('Snapshot indisponível. Carregue a nuvem e tente novamente.');
-                  }
-                  const aplicado = aplicarAtendimentoLote(
-                    fresh,
-                    doc.id,
-                    qtdsCapturadas,
-                    nomeAt,
-                    receb,
-                    matAt,
-                    continuacao,
-                    identHist,
-                  );
-                  if (!aplicado.ok) {
-                    throw new Error(aplicado.erro);
-                  }
-                  return { nextPayload: aplicado.payload, baselineUpdatedAt: updatedAt };
-                });
-                if (result.error) {
-                  appAlert(result.conflict ? 'Conflito de dados' : 'Supabase', result.error);
-                  if (result.conflict) {
-                    void carregarNuvem();
-                  }
-                  return;
-                }
-                const aplicadoLocal = aplicarAtendimentoLote(
-                  payload!,
-                  doc.id,
-                  qtdsCapturadas,
-                  nomeAt,
-                  receb,
-                  matAt,
-                  continuacao,
-                  identHist,
-                );
-                if (!aplicadoLocal.ok) {
-                  appAlert('Atendimento', aplicadoLocal.erro);
-                  return;
-                }
-                setPayload(aplicadoLocal.payload);
-                if (result.updatedAt) {
-                  setNuvemAt(result.updatedAt);
-                }
-                const docs = aplicadoLocal.payload.documentos as DocumentoPlanejamento[] | undefined;
-                const num = String(docParaRecibo.numero ?? '').trim();
-                const rev = String(docParaRecibo.revisao ?? '').trim();
-                const atualizado =
-                  docs?.find((d) => String(d.id) === String(doc.id)) ??
-                  (num ? docs?.find((d) => String(d.numero ?? '').trim() === num && String(d.revisao ?? '').trim() === rev) : undefined);
-                if (atualizado) {
+              if (!payload || !nuvemAt) {
+                appAlert('Atendimento', 'Carregue o snapshot da nuvem antes de registar.');
+                return;
+              }
+              const payloadAntes = payloadRef.current ?? payload;
+              const docParaRecibo = deepClone(doc);
+              const qtdsCapturadas = { ...qtds };
+              const idsHistoricoAntes = new Set(
+                ((payloadAntes.atendimentoHistorico ?? []) as { id?: number }[]).map((h) => h.id),
+              );
+              const qSum = Object.values(qtdsCapturadas).reduce((a, b) => a + b, 0);
+              const qKey = Object.entries(qtdsCapturadas)
+                .sort(([a], [b]) => Number(a) - Number(b))
+                .map(([k, v]) => `${k}:${v}`)
+                .join('|');
+              const idempotencyKey = buildAtendimentoIdempotencyKey({
+                loteId: res.loteId,
+                loteNumero: res.loteNumero,
+                documentoId: doc.id,
+                codigoMaterial: qKey || 'linhas',
+                quantidade: qSum,
+              });
+              setPayload(res.payload);
+              payloadRef.current = res.payload;
+              const docs = res.payload.documentos as DocumentoPlanejamento[] | undefined;
+              const num = String(docParaRecibo.numero ?? '').trim();
+              const rev = String(docParaRecibo.revisao ?? '').trim();
+              const atualizado =
+                docs?.find((d) => String(d.id) === String(doc.id)) ??
+                (num ? docs?.find((d) => String(d.numero ?? '').trim() === num && String(d.revisao ?? '').trim() === rev) : undefined);
+              if (atualizado) {
+                const cod = codigoAlvoPlanejamento;
+                if (cod && !materialTemDemandaPendenteNoDocumento(res.payload, String(atualizado.id), cod)) {
+                  setDoc(null);
+                  setBuscaDoc('');
+                  setQtdLinha({});
+                  const restantes = listarDocumentosComDemandaPendenteMaterial(res.payload, cod);
+                  setMostrarListaDocsMaterial(restantes.length > 1);
+                } else {
                   setDoc(deepClone(atualizado));
                 }
-                const itensLinha: { codigo: string; qtd: number; unidade: string; descricao: string }[] = [];
+              }
+              const itensLinha: { codigo: string; qtd: number; unidade: string; descricao: string }[] = [];
+              const novasHistorico = ((res.payload.atendimentoHistorico ?? []) as Record<string, unknown>[]).filter(
+                (h) => !idsHistoricoAntes.has(h.id as number),
+              );
+              if (novasHistorico.length > 0) {
+                for (const h of novasHistorico) {
+                  itensLinha.push({
+                    codigo: String(h.codigo ?? ''),
+                    qtd: Number(h.quantidade) || 0,
+                    unidade: String(h.unidade ?? 'UN'),
+                    descricao: String(h.descricao ?? ''),
+                  });
+                }
+              } else {
                 for (const [idxStr, q] of Object.entries(qtdsCapturadas)) {
                   if (!Number(q) || Number(q) <= 0) continue;
                   const idx = Number(idxStr);
@@ -871,43 +1291,50 @@ export default function AtendimentoScreen() {
                     descricao: String(it.descricao ?? ''),
                   });
                 }
-                const linhaSessao: LinhaSessaoAtendimento = {
-                  tipo: 'documento',
-                  loteNumero: res.loteNumero,
-                  docNumero: String(docParaRecibo.numero ?? ''),
-                  docRevisao: String(docParaRecibo.revisao ?? ''),
-                  docDesc: String(docParaRecibo.descricao ?? ''),
-                  docResponsavel: String(docParaRecibo.responsavel ?? '').trim(),
-                  itens: itensLinha,
-                };
-                const nextSessao = [...sessaoAtendimentoRef.current, linhaSessao];
-                sessaoAtendimentoRef.current = nextSessao;
-                setSessaoAtendimentoItens(nextSessao);
-                setQtdLinha({});
-                sessaoCodigoBarrasLoteRef.current = { loteNumero: res.loteNumero, loteId: res.loteId };
-                const syncHint = result.queued
-                  ? 'Alteracao pendente de sincronizacao com a nuvem.'
-                  : 'Gravado na nuvem.';
-                appAlert(
-                  'Atendimento registado',
-                  `Documento ${docNum}: ${syncHint}\nProtocolo: ${res.loteNumero}${continuacao ? '\n(mesmo protocolo — vários itens no mesmo comprovante)' : ''}\n\nSessão para «${receb}»: ${nextSessao.length} operação(ões).\n\nDeseja continuar a registar ou finalizar o atendimento?`,
-                  [
-                    { text: 'Continuar', style: 'cancel' },
-                    {
-                      text: 'Finalizar atendimento',
-                      onPress: () => finalizarSessaoAtendimentoEPartilhar(),
-                    },
-                  ],
-                );
-              } finally {
-                setSaving(false);
               }
+              const linhaSessao: LinhaSessaoAtendimento = {
+                tipo: 'documento',
+                loteNumero: res.loteNumero,
+                docNumero: String(docParaRecibo.numero ?? ''),
+                docRevisao: String(docParaRecibo.revisao ?? ''),
+                docDesc: String(docParaRecibo.descricao ?? ''),
+                docResponsavel: String(docParaRecibo.responsavel ?? '').trim(),
+                itens: itensLinha,
+              };
+              const nextSessao = [...sessaoAtendimentoRef.current, linhaSessao];
+              sessaoAtendimentoRef.current = nextSessao;
+              setSessaoAtendimentoItens(nextSessao);
+              setQtdLinha({});
+              sessaoCodigoBarrasLoteRef.current = { loteNumero: res.loteNumero, loteId: res.loteId };
+              sincronizarAtendimentoEmBackground(payloadAntes, res.payload, idempotencyKey);
+              appAlert(
+                'Atendimento registado',
+                `Documento ${docNum}: registado neste aparelho.\nProtocolo: ${res.loteNumero}${continuacao ? '\n(mesmo protocolo — vários itens no mesmo comprovante)' : ''}\n\nSessão para «${receb}»: ${nextSessao.length} operação(ões).\n\nDeseja continuar a registar ou finalizar o atendimento?`,
+                [
+                  { text: 'Continuar', style: 'cancel' },
+                  {
+                    text: 'Finalizar atendimento',
+                    onPress: () => finalizarSessaoAtendimentoEPartilhar(),
+                  },
+                ],
+              );
             })();
           },
         },
       ]
     );
-  }, [carregarNuvem, doc, finalizarSessaoAtendimentoEPartilhar, nuvemAt, payload, qtdLinha, recebedor]);
+  }, [
+    carregarNuvem,
+    codigoAlvoPlanejamento,
+    doc,
+    finalizarSessaoAtendimentoEPartilhar,
+    nuvemAt,
+    obterReservaProtocoloNovaSessao,
+    payload,
+    qtdLinha,
+    recebedor,
+    sincronizarAtendimentoEmBackground,
+  ]);
 
   const escolherRecebedorColaborador = useCallback((c: Colaborador) => {
     if (blurSugestoesTimer.current) clearTimeout(blurSugestoesTimer.current);
@@ -915,57 +1342,101 @@ export default function AtendimentoScreen() {
     setMostrarSugestoesRecebedor(false);
   }, []);
 
-  const selecionarDocumentoPlanejamento = useCallback((d: DocumentoPlanejamento) => {
-    if (blurDocsTimer.current) clearTimeout(blurDocsTimer.current);
-    setBuscaDoc(String(d.numero ?? ''));
-    setDoc(deepClone(d));
-    setQtdLinha({});
-    setMsgBusca(null);
-    setCandidatosBuscaDoc(null);
-    setMostrarListaDocsMaterial(false);
-  }, []);
+  const selecionarDocumentoPlanejamento = useCallback(
+    (d: DocumentoPlanejamento) => {
+      if (codigoAlvoPlanejamento && !documentoPermitidoParaCodigoScaneado(d)) return;
+      if (blurDocsTimer.current) clearTimeout(blurDocsTimer.current);
+      setBuscaDoc(String(d.numero ?? ''));
+      setMostrarListaDocsMaterial(false);
+      abrirDocumentoAtendimento(d);
+    },
+    [codigoAlvoPlanejamento, documentoPermitidoParaCodigoScaneado, abrirDocumentoAtendimento],
+  );
 
-  /**
-   * Código só existe num desenho no planejamento → abre esse documento de referência.
-   * Vários desenhos com o mesmo código → o utilizador escolhe (lista com pendência ou «todos»).
-   * Ao mudar o material no campo (novo scan ou outro código), limpa o desenho anterior para não ficar o filtro do item anterior.
-   */
+  useEffect(() => {
+    const cur = codigoAlvoPlanejamento;
+    if (!cur) {
+      prevCodigoAlvoPlanejamentoRef.current = null;
+      setMostrarListaDocsMaterial(false);
+      return;
+    }
+    const prev = prevCodigoAlvoPlanejamentoRef.current;
+    if (prev !== cur) {
+      setDoc(null);
+      setBuscaDoc('');
+      setMsgBusca(null);
+      setCandidatosBuscaDoc(null);
+      prevCodigoAlvoPlanejamentoRef.current = cur;
+    }
+  }, [codigoAlvoPlanejamento]);
+
   useDebouncedEffect(
     () => {
-      if (!payload?.documentos?.length) return;
-      const cur = codigoAlvoPlanejamento;
-      if (!cur) {
-        prevCodigoAlvoPlanejamentoRef.current = null;
-        setMostrarListaDocsMaterial(false);
+      if (!payload || !codigoAlvoPlanejamento) {
+        setPendenciaMaterialCache(null);
+        setCarregandoDesenhos(false);
         return;
       }
-      const prev = prevCodigoAlvoPlanejamentoRef.current;
-      if (prev !== cur) {
-        setDoc(null);
-        setBuscaDoc('');
-        setMsgBusca(null);
-        setCandidatosBuscaDoc(null);
-        prevCodigoAlvoPlanejamentoRef.current = cur;
-      }
-      const lista = listarDocumentosComDemandaPendenteMaterial(payload, cur);
-      if (lista.length === 1) {
-        setMostrarListaDocsMaterial(false);
-        const d = lista[0].documento;
-        setDoc(deepClone(d));
-        setBuscaDoc(String(d.numero ?? ''));
-        setMsgBusca(null);
-        setCandidatosBuscaDoc(null);
-        setQtdLinha({});
-      } else if (lista.length > 1) {
-        /** Vários desenhos: manter lista visível (novo scan ou continuar atendimento após baixa anterior). */
-        setMostrarListaDocsMaterial(true);
-      } else {
-        setMostrarListaDocsMaterial(false);
-      }
+      const cur = codigoAlvoPlanejamento.trim();
+      if (!cur) return;
+      const reqId = ++pendenciaMaterialReqRef.current;
+      setCarregandoDesenhos(true);
+      void (async () => {
+        try {
+          const rpc = await listDocumentosPendenciaMaterialFromCloud(cur);
+          if (pendenciaMaterialReqRef.current !== reqId) return;
+          if (!rpc.missing && rpc.documentos.length > 0) {
+            const docs = rpc.documentos as unknown as DocumentoPlanejamento[];
+            mergeDocumentosNoPayload(docs);
+            const base = payloadRef.current;
+            const miniPayload = base
+              ? { ...base, documentos: mergeDocumentosPlanejamentoNoPayload([], docs) }
+              : null;
+            const lista = miniPayload
+              ? listarDocumentosComDemandaPendenteMaterial(miniPayload, cur)
+              : [];
+            setPendenciaMaterialCache({ codigo: cur, docs: lista });
+            return;
+          }
+          const base = payloadRef.current;
+          const lista = base ? listarDocumentosComDemandaPendenteMaterial(base, cur) : [];
+          setPendenciaMaterialCache({ codigo: cur, docs: lista });
+        } catch {
+          if (pendenciaMaterialReqRef.current !== reqId) return;
+          const base = payloadRef.current;
+          const lista = base ? listarDocumentosComDemandaPendenteMaterial(base, cur) : [];
+          setPendenciaMaterialCache({ codigo: cur, docs: lista });
+        } finally {
+          if (pendenciaMaterialReqRef.current === reqId) {
+            setCarregandoDesenhos(false);
+          }
+        }
+      })();
     },
-    [payload, codigoAlvoPlanejamento],
-    320,
+    [payload, codigoAlvoPlanejamento, mergeDocumentosNoPayload],
+    280,
   );
+
+  useEffect(() => {
+    if (!codigoAlvoPlanejamento || !payload) return;
+    const lista = docsComPendenteMaterial;
+    if (lista.length === 1) {
+      setMostrarListaDocsMaterial(false);
+      const d = lista[0].documento;
+      setDoc(deepClone(d));
+      setBuscaDoc(String(d.numero ?? ''));
+      setMsgBusca(null);
+      setCandidatosBuscaDoc(null);
+      setQtdLinha({});
+    } else if (lista.length > 1) {
+      setMostrarListaDocsMaterial(true);
+    } else if ((payload.documentos?.length ?? 0) > 0) {
+      setMostrarListaDocsMaterial(false);
+      setDoc(null);
+      setBuscaDoc('');
+      setQtdLinha({});
+    }
+  }, [codigoAlvoPlanejamento, payload, docsComPendenteMaterial]);
 
   if (!configured) {
     return (
@@ -982,60 +1453,94 @@ export default function AtendimentoScreen() {
   return (
     <ScrollView
       style={styles.scroll}
-      contentContainerStyle={styles.container}
+      contentContainerStyle={[styles.container, shell.screenPad]}
       keyboardShouldPersistTaps="handled"
     >
-      <Text style={styles.title}>Atendimento</Text>
-      {mostrarTextosAjudaModulos ? (
-        <Text style={styles.hint}>
-          Carregue a nuvem, indique quem recebe, escaneie ou abra o desenho e registe as baixas. Por código: «Dar baixa» confirma e grava na nuvem de
-          imediato (como o registo por documento). Por desenho: confirme em «Registrar atendimento e gravar na nuvem». O mesmo protocolo (ATD) segue até
-          mudar o recebedor ou finalizar a sessão — «Finalizar sessão» gera o comprovante único.
-        </Text>
-      ) : null}
+      <ModuleScreenHeader
+        kicker="Operação de campo"
+        title="Atendimento"
+        helpText="Carregue a nuvem, indique quem recebe, escaneie ou abra o desenho e registe as baixas. A gravação é imediata neste aparelho; a sincronização com a nuvem corre em segundo plano (faixa «Nuvem» em cima). O mesmo protocolo (ATD) segue até mudar o recebedor ou finalizar a sessão."
+        showHelp={mostrarTextosAjudaModulos}
+      />
 
-      <Pressable style={[styles.btn, loading && styles.btnOff]} onPress={carregarNuvem} disabled={loading || saving}>
-        {loading ? <ActivityIndicator color={colors.text} /> : <Text style={styles.btnText}>Carregar dados da nuvem</Text>}
-      </Pressable>
-      {nuvemAt ? (
-        <Text style={styles.meta}>Snapshot: {formatarDataHoraLocal(nuvemAt)} (hora do telemóvel)</Text>
-      ) : null}
+      <CloudSyncStrip
+        configured={configured}
+        error={loadErr}
+        errorLabel="Erro ao carregar"
+        loading={(loading && !payload) || syncingComandos || finalizandoSessao}
+        pendingLabel={
+          finalizandoSessao
+            ? 'A confirmar todas as baixas na nuvem…'
+            : syncingComandos
+              ? 'A sincronizar atendimento…'
+              : resumoSyncSessao && !resumoSyncSessao.emDia
+                ? `${resumoSyncSessao.itensSessao} na sessão · ${resumoSyncSessao.itensNuvem} confirmados na nuvem`
+                : resumoSyncSessao?.emDia
+                  ? `${resumoSyncSessao.itensNuvem} item(ns) confirmados na nuvem`
+                  : comandosPendentes > 0
+                    ? `${comandosPendentes} atendimento(s) na fila offline`
+                    : loading && !payload
+                      ? 'A carregar dados…'
+                      : undefined
+        }
+        updatedAt={nuvemAt}
+      />
+
       {payload ? (
-        <Text style={styles.meta}>
-          {payload.documentos?.length ?? 0} documento(s) · {payload.materiais?.length ?? 0} material(is) ·{' '}
-          {payload.colaboradores?.length ?? 0} colaborador(es)
-        </Text>
+        <StatPillRow
+          items={[
+            {
+              label: 'Desenhos',
+              value: carregandoDesenhos
+                ? 'a carregar…'
+                : (payload.documentos?.length ?? 0) > 0
+                  ? (payload.documentos!.length > MAX_DESENHOS_EM_MEMORIA
+                      ? 'sob demanda'
+                      : `${payload.documentos!.length} carreg.`)
+                  : 'sob demanda',
+            },
+            {
+              label: 'Recebimentos',
+              value: payload.recebimentos?.length ?? 0,
+            },
+            { label: 'Colaboradores', value: payload.colaboradores?.length ?? 0 },
+          ]}
+        />
       ) : null}
-      {payload && (payload.documentos?.length ?? 0) === 0 && (payload.materiais?.length ?? 0) > 0 ? (
-        <View style={styles.warnDestaque}>
-          <Text style={styles.warnDestaqueTit}>Desenhos ainda não estão na nuvem</Text>
-          <Text style={styles.warnDestaqueTxt}>
-            Este telemóvel vê {payload.materiais!.length} material(is) no snapshot, mas 0 desenhos. No I.S.O PRO no PC, abra Documentos e use
-            «Enviar planejamento deste PC para a nuvem (mobile)». Depois toque em «Carregar dados da nuvem» aqui. Confirme o mesmo Supabase no
-            `.env` do app.
-          </Text>
-        </View>
-      ) : null}
-      {payload && (payload.documentos?.length ?? 0) === 0 && (payload.materiais?.length ?? 0) === 0 ? (
-        <Text style={styles.warn}>
-          0 desenhos no snapshot: o planejamento pode não ter sido enviado do PC ou o `.env` aponta para outro projeto Supabase. No PC (Documentos),
-          envie o planejamento para a nuvem; na aba Início use «Verificar leitura do snapshot».
-        </Text>
-      ) : null}
-      {loadErr ? <Text style={styles.err}>{loadErr}</Text> : null}
 
+      <PrimaryActionButton
+        disabled={loading}
+        label="Carregar dados da nuvem"
+        loading={loading}
+        loadingLabel="A carregar da nuvem…"
+        onPress={() => void carregarNuvem()}
+      />
+      {payload && (payload.recebimentos?.length ?? 0) === 0 ? (
+        <Text style={styles.warn}>
+          Sem recebimentos no snapshot — confira se o PC enviou dados para a nuvem (mesmo Supabase no `.env`).
+        </Text>
+      ) : null}
+      {payload && (payload.documentos?.length ?? 0) === 0 ? (
+        <Text style={styles.hintSmall}>
+          Desenhos carregam ao escanear código ou abrir documento — não é preciso baixar todos de uma vez.
+        </Text>
+      ) : null}
       <Text style={styles.label}>Quem recebeu / retirou o material *</Text>
       {mostrarTextosAjudaModulos ? (
         <Text style={styles.hintSmall}>
           Tem de ser um nome ou matrícula igual ao cadastro de colaboradores no I.S.O PRO — toque numa sugestão ou escreva exatamente como está no cadastro.
+          {sessaoAtendimentoItens.length > 0
+            ? ' Com baixas em curso, o recebedor fica bloqueado — finalize a sessão para mudar.'
+            : ''}
         </Text>
       ) : null}
       <View style={styles.recebedorWrap}>
         <TextInput
-          style={[styles.input, styles.inputRecebedor]}
+          style={[styles.input, styles.inputRecebedor, sessaoAtendimentoItens.length > 0 && styles.btnOff]}
           placeholder="Nome, matrícula…"
           placeholderTextColor={colors.placeholder}
           value={recebedor}
+          editable={sessaoAtendimentoItens.length === 0}
           onChangeText={(t) => {
             setRecebedor(t);
             setMostrarSugestoesRecebedor(true);
@@ -1154,38 +1659,71 @@ export default function AtendimentoScreen() {
           }
         />
         <Pressable
-          style={[styles.btnSec, styles.btnBarras, (!payload || loading) && styles.btnOff]}
+          style={({ pressed }) => [
+            styles.btnSec,
+            styles.btnBarras,
+            (!payload || loading) && styles.btnOff,
+            pressed && !(!payload || loading) && styles.btnPressed,
+          ]}
+          android_ripple={{ color: 'rgba(255,255,255,0.18)' }}
           onPress={abrirScanner}
-          disabled={!payload || loading || saving}
+          disabled={!payload || loading}
         >
           <Text style={styles.btnTextSec}>Escanear</Text>
         </Pressable>
         <Pressable
-          style={[styles.btnOk, styles.btnBarrasGo, (saving || !podeDarBaixaBarras) && styles.btnOff]}
+          style={({ pressed }) => [
+            styles.btnOk,
+            styles.btnBarrasGo,
+            !podeDarBaixaBarras && styles.btnOff,
+            pressed && podeDarBaixaBarras && styles.btnPressed,
+          ]}
+          android_ripple={{ color: 'rgba(255,255,255,0.18)' }}
           onPress={registarPorCodigo}
-          disabled={saving || !podeDarBaixaBarras}
+          disabled={!podeDarBaixaBarras}
         >
           <Text style={styles.btnText}>Dar baixa</Text>
         </Pressable>
       </View>
       {sessaoAtendimentoItens.length > 0 ? (
-        <View style={styles.sessaoBarrasBox}>
+        <SectionCard title={`Sessão · ${sessaoAtendimentoItens.length} operação(ões)`}>
+          {resumoSyncSessao ? (
+            <Text
+              style={[
+                styles.sessaoBarrasTxt,
+                !resumoSyncSessao.emDia && { color: colors.warn ?? '#fbbf24' },
+              ]}
+            >
+              {resumoSyncSessao.emDia
+                ? `Todos os ${resumoSyncSessao.itensNuvem} item(ns) confirmados na nuvem — pode finalizar com segurança.`
+                : `Sincronização: ${resumoSyncSessao.itensSessao} nesta sessão · ${resumoSyncSessao.itensNuvem} na nuvem (${resumoSyncSessao.faltam} pendente(s)). Aguarde ou toque em «Carregar dados da nuvem».`}
+            </Text>
+          ) : null}
           {mostrarTextosAjudaModulos ? (
             <Text style={styles.sessaoBarrasTxt}>
-              Sessão: {sessaoAtendimentoItens.length} linha(s) no recibo — vários registos seguem o mesmo protocolo (um atendimento no sistema).
-              «Finalizar» gera o comprovante único (partilhar ou imprimir).
+              Vários registos seguem o mesmo protocolo (um atendimento no sistema). «Finalizar» gera o comprovante único (partilhar ou imprimir).
             </Text>
           ) : (
-            <Text style={styles.sessaoBarrasTxt}>Sessão: {sessaoAtendimentoItens.length} operação(ões) · finalizar gera o comprovante.</Text>
+            <Text style={styles.sessaoBarrasTxt}>Finalizar gera o comprovante único desta sessão.</Text>
           )}
           <Pressable
-            style={[styles.btnSessaoFim, !baseNuvemRecebedor && styles.btnOff]}
+            style={[
+              styles.btnSessaoFim,
+              (!baseNuvemRecebedor || finalizandoSessao) && styles.btnOff,
+            ]}
             onPress={() => finalizarSessaoAtendimentoEPartilhar()}
-            disabled={!baseNuvemRecebedor}
+            disabled={!baseNuvemRecebedor || finalizandoSessao}
           >
-            <Text style={styles.btnTextSec}>Finalizar sessão — comprovante único</Text>
+            {finalizandoSessao ? (
+              <View style={styles.finalizarRow}>
+                <ActivityIndicator color={colors.text} size="small" />
+                <Text style={styles.btnTextSec}>A confirmar na nuvem…</Text>
+              </View>
+            ) : (
+              <Text style={styles.btnTextSec}>Finalizar sessão — comprovante único</Text>
+            )}
           </Pressable>
-        </View>
+        </SectionCard>
       ) : null}
 
       <Text style={styles.label}>Desenho de referência *</Text>
@@ -1275,6 +1813,13 @@ export default function AtendimentoScreen() {
               <Text style={styles.docsMaterialEmpty}>
                 Identifique o material em «Código do material» (scan ou digitação) para listar os desenhos com retirada ainda por fazer no planejamento.
               </Text>
+            ) : carregandoDesenhos ? (
+              <View style={{ alignItems: 'center', paddingVertical: 12 }}>
+                <ActivityIndicator color={colors.accent} />
+                <Text style={[styles.docsMaterialEmpty, { marginTop: 10 }]}>
+                  A buscar desenhos com pendência para {codigoAlvoPlanejamento ?? 'este material'}…
+                </Text>
+              </View>
             ) : docsComPendenteMaterial.length === 0 ? (
               <Text style={styles.docsMaterialEmpty}>
                 Nenhum desenho com necessidade de atendimento (planejamento) para {codigoAlvoPlanejamento ?? 'este material'}.
@@ -1314,10 +1859,22 @@ export default function AtendimentoScreen() {
                       <Text style={styles.docsMaterialRowSub} numberOfLines={2}>
                         {d.descricao ?? ''}
                       </Text>
-                      <Text style={styles.docsMaterialRowMeta}>
-                        Disponível p/ atend.: {formatQuantidadeExibicao(restanteMaterial)} · Estoque:{' '}
-                        {formatQuantidadeExibicao(saldoCod)}
-                      </Text>
+                      <StatPillRow
+                        dense
+                        columns={2}
+                        items={[
+                          {
+                            label: 'Pend. de atend.',
+                            value: formatQuantidadeComUnidade(restanteMaterial, unidadeMaterialAlvo),
+                            tone: restanteMaterial > 0 ? 'success' : 'muted',
+                          },
+                          {
+                            label: 'Estoque',
+                            value: formatQuantidadeComUnidade(saldoCod, unidadeMaterialAlvo),
+                            tone: saldoCod <= 0 ? 'warn' : 'default',
+                          },
+                        ]}
+                      />
                     </Pressable>
                   );
                 }}
@@ -1327,20 +1884,26 @@ export default function AtendimentoScreen() {
         ) : null}
       </View>
       {payload &&
-      (payload.documentos?.length ?? 0) > 0 &&
       buscaDoc.trim().length === 0 &&
-      !codigoBarras.trim() ? (
+      !codigoBarras.trim() &&
+      ((payload.documentos?.length ?? 0) > 0 || carregandoDesenhos) ? (
         <View style={[styles.docsMaterialBox, { marginBottom: 12 }]}>
           <Text style={styles.docsMaterialTit}>
             {doc
               ? 'Desenho em referência — use a pesquisa para localizar outro'
-              : `Todos os desenhos neste telemóvel (${payload.documentos!.length}) — toque para abrir`}
+              : carregandoDesenhos && (payload.documentos?.length ?? 0) === 0
+                ? 'A carregar desenhos deste telemóvel…'
+                : `Pendentes de atendimento neste telemóvel (${payload.documentos!.length}) — toque para abrir`}
           </Text>
+          {carregandoDesenhos && (payload.documentos?.length ?? 0) === 0 ? (
+            <Text style={[styles.hintSmall, { marginBottom: 8 }]}>Aguarde — a lista completa aparece em seguida.</Text>
+          ) : null}
           {mostrarTextosAjudaModulos && payload.documentos!.length > 400 && !doc ? (
             <Text style={[styles.hintSmall, { marginBottom: 8 }]}>
               Lista grande: use o campo de pesquisa em cima para ir direto ao desenho — a rolagem continua disponível.
             </Text>
           ) : null}
+          {(payload.documentos?.length ?? 0) > 0 ? (
           <FlatList
             style={{ maxHeight: 220 }}
             nestedScrollEnabled
@@ -1370,10 +1933,27 @@ export default function AtendimentoScreen() {
               );
             }}
           />
+          ) : null}
         </View>
       ) : null}
-      <Pressable style={[styles.btnSec, (!payload || loading) && styles.btnOff]} onPress={buscarDocumento} disabled={!payload || loading}>
-        <Text style={styles.btnTextSec}>Buscar documento</Text>
+      <Pressable
+        style={({ pressed }) => [
+          styles.btnSec,
+          (!payload || loading || buscandoDoc) && styles.btnOff,
+          pressed && !(!payload || loading || buscandoDoc) && styles.btnPressed,
+        ]}
+        android_ripple={{ color: 'rgba(255,255,255,0.18)' }}
+        onPress={buscarDocumento}
+        disabled={!payload || loading || buscandoDoc}
+      >
+        {buscandoDoc ? (
+          <View style={styles.finalizarRow}>
+            <ActivityIndicator color={colors.text} size="small" />
+            <Text style={styles.btnTextSec}>A buscar na nuvem…</Text>
+          </View>
+        ) : (
+          <Text style={styles.btnTextSec}>Buscar documento</Text>
+        )}
       </Pressable>
       {msgBusca ? <Text style={styles.warn}>{msgBusca}</Text> : null}
       {candidatosBuscaDocParaExibir && candidatosBuscaDocParaExibir.length > 0 ? (
@@ -1419,7 +1999,7 @@ export default function AtendimentoScreen() {
           </Text>
           {mostrarTextosAjudaModulos && !codigoAlvoPlanejamento ? (
             <Text style={styles.hintSmall}>
-              «Disponível p/ atend.» = quantidade do planejamento que ainda pode ser retirada neste desenho (não é recebimento). Estoque = disponível no sistema.
+              «Pend. de atend.» = pendente de atendimento no desenho (projeto − já atendido). «Estoque» = saldo no sistema.
             </Text>
           ) : null}
           {(() => {
@@ -1448,6 +2028,7 @@ export default function AtendimentoScreen() {
               saldoPorCodigo?.get(codigoMaterialKey(codigoNaLinhaPlanejamento(it as DocumentoItemPlanejamento))) ?? 0;
             const semRecebimento = saldoEstoque <= 0 && rest > 0;
             const compacto = Boolean(codigoAlvoPlanejamento);
+            const unidadeLinha = String(it.unidade ?? unidadeMaterialAlvo ?? '').trim();
             return (
               <View key={i} style={[styles.row, semSaldo && styles.rowSemSaldo]}>
                 <View style={styles.rowTxt}>
@@ -1458,26 +2039,48 @@ export default function AtendimentoScreen() {
                     {descricaoNaLinhaPlanejamento(it as DocumentoItemPlanejamento)}
                   </Text>
                   {compacto ? (
-                    <Text style={[styles.meta2, semSaldo && styles.metaSemSaldo, semRecebimento && { color: colors.warn }]}>
-                      Disponível p/ atend.: {formatQuantidadeExibicao(rest)} · Estoque:{' '}
-                      {formatQuantidadeExibicao(saldoEstoque)}
-                    </Text>
+                    <StatPillRow
+                      dense
+                      columns={2}
+                      items={[
+                        {
+                          label: 'Pend. de atend.',
+                          value: formatQuantidadeComUnidade(rest, unidadeLinha),
+                          tone: semSaldo ? 'muted' : 'success',
+                        },
+                        {
+                          label: 'Estoque',
+                          value: formatQuantidadeComUnidade(saldoEstoque, unidadeLinha),
+                          tone: semRecebimento ? 'warn' : 'default',
+                        },
+                      ]}
+                    />
                   ) : (
-                    <>
-                      <Text style={[styles.meta2, semSaldo && styles.metaSemSaldo]}>
-                        Projeto: {formatQuantidadeExibicao(qProj)} {it.unidade ?? ''} · Já atendido:{' '}
-                        {formatQuantidadeExibicao(qAt)} · Disponível p/ atend.: {formatQuantidadeExibicao(rest)}
-                      </Text>
-                      <Text
-                        style={[
-                          styles.meta2,
-                          semRecebimento && { color: colors.warn },
-                          semSaldo && styles.metaSemSaldo,
-                        ]}
-                      >
-                        Saldo no estoque: {formatQuantidadeExibicao(saldoEstoque)}
-                      </Text>
-                    </>
+                    <StatPillRow
+                      dense
+                      columns={2}
+                      items={[
+                        {
+                          label: 'Projeto',
+                          value: formatQuantidadeComUnidade(qProj, unidadeLinha),
+                        },
+                        {
+                          label: 'Atendido',
+                          value: formatQuantidadeComUnidade(qAt, unidadeLinha),
+                          tone: semSaldo ? 'muted' : 'default',
+                        },
+                        {
+                          label: 'Pend. de atend.',
+                          value: formatQuantidadeComUnidade(rest, unidadeLinha),
+                          tone: semSaldo ? 'muted' : 'success',
+                        },
+                        {
+                          label: 'Estoque',
+                          value: formatQuantidadeComUnidade(saldoEstoque, unidadeLinha),
+                          tone: semRecebimento ? 'warn' : 'default',
+                        },
+                      ]}
+                    />
                   )}
                   {semRecebimento ? (
                     <Text style={styles.badgeSemSaldo}>Sem recebimento suficiente — não atender</Text>
@@ -1503,16 +2106,25 @@ export default function AtendimentoScreen() {
             <Text style={[styles.err, { marginTop: 10 }]}>{validacaoQuantidadesLinhasDoc.motivo}</Text>
           ) : null}
           <Pressable
-            style={[styles.btnOk, (saving || !podeRegistarPorLinhasDocumento) && styles.btnOff]}
+            style={[styles.btnOk, !podeRegistarPorLinhasDocumento && styles.btnOff]}
             onPress={registar}
-            disabled={saving || !podeRegistarPorLinhasDocumento}
+            disabled={!podeRegistarPorLinhasDocumento}
           >
             <Text style={styles.btnText}>Registar atendimento e gravar na nuvem</Text>
           </Pressable>
         </View>
       ) : null}
 
-      {saving ? <ActivityIndicator style={{ marginTop: 16 }} color={colors.accent} /> : null}
+      {syncingComandos || comandosPendentes > 0 ? (
+        <ActivityIndicator style={{ marginTop: 16 }} color={colors.accent} />
+      ) : null}
+
+      <AtendimentoOperacaoOverlay
+        visible={operacaoOverlay.visible}
+        titulo={operacaoOverlay.titulo}
+        mensagem={operacaoOverlay.mensagem}
+        colors={colors}
+      />
 
       <Modal visible={scannerOpen} animationType="slide" onRequestClose={() => setScannerOpen(false)}>
         <View style={styles.scannerWrap}>

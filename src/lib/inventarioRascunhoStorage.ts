@@ -6,6 +6,8 @@ export type InventarioRascunhoPersistido = {
   inventarioId: string;
   /** Quantidade contada por id de linha (texto livre como na conferência). */
   qtdTextoPorItemId: Record<string, string>;
+  /** Local da contagem por id de linha. */
+  localTextoPorItemId: Record<string, string>;
   updatedAt: string;
 };
 
@@ -21,7 +23,11 @@ export async function lerRascunhoInventario(inventarioId: string): Promise<Inven
   const raw = await AsyncStorage.getItem(keyFor(inventarioId));
   if (!raw) return null;
   try {
-    return JSON.parse(raw) as InventarioRascunhoPersistido;
+    const parsed = JSON.parse(raw) as InventarioRascunhoPersistido;
+    return {
+      ...parsed,
+      localTextoPorItemId: parsed.localTextoPorItemId ?? {},
+    };
   } catch {
     return null;
   }

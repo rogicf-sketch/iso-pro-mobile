@@ -44,6 +44,13 @@ export const SNAPSHOT_MOBILE_CONFERENCIA_WRITE_READ_KEYS = [
 
 export const SNAPSHOT_MOBILE_CONFERENCIA_PATCH_KEYS = ['recebimentos', 'dataAtualizacao'] as const;
 
+/**
+ * Delta fundido por id no RPC `iso_pro_patch_snapshot`.
+ * Sem isto, um patch com `recebimentos: [1 NF]` SUBSTITUI a lista inteira na nuvem
+ * (incidente 2026-07-18: 125 → 1).
+ */
+export const SNAPSHOT_MOBILE_CONFERENCIA_MERGE_KEYS = ['recebimentos'] as const;
+
 /** Consulta: só materiais/colaboradores — docs/recebimentos vêm de RPCs paginadas. */
 export const SNAPSHOT_MOBILE_CONSULTA_READ_KEYS = ['materiais', 'colaboradores'] as const;
 

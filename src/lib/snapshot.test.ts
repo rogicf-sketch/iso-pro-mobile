@@ -9,6 +9,10 @@ import { getSupabase } from './supabase';
 vi.mock('./registrarAtendimento', () => ({
   garantirIdsDocumentosPlanejamento: vi.fn(),
 }));
+// `errorReporting` puxa expo-constants/react-native (Flow) — o vitest não parseia.
+vi.mock('./errorReporting', () => ({
+  captureOperationalEvent: vi.fn(),
+}));
 vi.mock('./config', () => ({
   SUPABASE_URL: 'https://test.supabase.co',
 }));

@@ -10,3 +10,10 @@ export function formatQuantidadeExibicao(n: number): string {
   if (Math.abs(r - inteiro) < 1e-9) return String(inteiro);
   return r.toFixed(3).replace(/\.?0+$/, '');
 }
+
+/** Quantidade + unidade do item (ex.: `4 PC`) — usado nos quadros do Atendimento. */
+export function formatQuantidadeComUnidade(n: number, unidade?: string | null): string {
+  const q = formatQuantidadeExibicao(n);
+  const u = String(unidade ?? '').trim();
+  return u ? `${q} ${u}` : q;
+}

@@ -5,7 +5,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import { AuthScreenLayout } from '@/src/components/AuthScreenLayout';
 import { BrandLogoPanel } from '@/src/components/BrandLogoPanel';
-import { loginMobile } from '@/src/lib/mobileAuth';
+import { loginMobile, completeMobileLoginAfterMfa, cancelMobileMfaLogin, isIsoProMfaRequiredError, type MobileSession } from '@/src/lib/mobileAuth';
 import { resolveMobileAccess } from '@/src/lib/mobileAccess';
 import {
   getActiveTenantId,
@@ -34,6 +34,8 @@ export default function LoginScreen() {
   const [saving, setSaving] = useState(false);
   const [tenants, setTenants] = useState<IsoProTenantListItem[]>([]);
   const [tenantId, setTenantId] = useState(getBuildTimeTenantId());
+  const [mfaPending, setMfaPending] = useState<{ factorId: string; session: MobileSession } | null>(null);
+  const [mfaCode, setMfaCode] = useState('');
 
   useEffect(() => {
     void (async () => {
@@ -118,26 +120,39 @@ export default function LoginScreen() {
     buildInfo: { color: colors.textMuted, fontSize: 11, marginTop: 12, textAlign: 'center' },
   });
 
+  async function finishAfterSession(session: MobileSession) {
+    const access = await resolveMobileAccess(session);
+    if (access.state === 'blocked') {
+      router.replace('/device-blocked');
+      return;
+    }
+    if (access.state === 'pending') {
+      router.replace('/device-pending');
+      return;
+    }
+    router.replace('/(tabs)');
+  }
+
   async function handleLogin() {
     setSaving(true);
     setError('');
     try {
+      if (mfaPending) {
+        const session = await completeMobileLoginAfterMfa(mfaPending.factorId, mfaCode, mfaPending.session);
+        setMfaPending(null);
+        setMfaCode('');
+        await finishAfterSession(session);
+        return;
+      }
       await setActiveTenantId(tenantId);
       const session = await loginMobile(login.trim(), senha, tenantId);
-      const access = await resolveMobileAccess(session);
-
-      if (access.state === 'blocked') {
-        router.replace('/device-blocked');
-        return;
-      }
-
-      if (access.state === 'pending') {
-        router.replace('/device-pending');
-        return;
-      }
-
-      router.replace('/(tabs)');
+      await finishAfterSession(session);
     } catch (err) {
+      if (isIsoProMfaRequiredError(err)) {
+        setMfaPending({ factorId: err.factorId, session: err.pendingSession });
+        setError('');
+        return;
+      }
       setError(err instanceof Error ? err.message : 'Nao foi possivel entrar.');
     } finally {
       setSaving(false);
@@ -156,15 +171,32 @@ export default function LoginScreen() {
         />
         <Text style={styles.kicker}>I.S.O PRO MOBILE</Text>
         <Text style={styles.title} testID="mobile-login-title">
-          Acesso do operador
+          {mfaPending ? 'Codigo MFA' : 'Acesso do operador'}
         </Text>
         <Text style={styles.hint}>
-          Utilize o mesmo login e senha criados no I.S.O PRO (Utilizadores). O perfil precisa de permissao no modulo Mobile. O aparelho fica
-          pendente ate o administrador autorizar em Dispositivos mobile.{'\n\n'}
-          Se aparecer «network request failed» ou erro de rede, a senha nem e verificada: falta ligação ao Supabase (variáveis EXPO_PUBLIC_* no EAS,
-          ambiente preview, e novo APK). Não existe login «admin/admin» por defeito na app — tem de existir em Utilizadores na base de dados.
+          {mfaPending
+            ? 'Introduza o codigo de 6 digitos da app authenticator para concluir o login.'
+            : 'Utilize o mesmo login e senha criados no I.S.O PRO (Utilizadores). O perfil precisa de permissao no modulo Mobile. O aparelho fica pendente ate o administrador autorizar em Dispositivos mobile.\n\nSe aparecer erro de rede, a senha nem é verificada — o telemóvel não alcançou o Supabase. Confirme Wi‑Fi ou 4G e tente de novo. Não existe login «admin/admin» por defeito — o utilizador tem de existir em Utilizadores no I.S.O PRO.'}
         </Text>
 
+        {mfaPending ? (
+          <View>
+            <Text style={styles.label}>Codigo authenticator</Text>
+            <TextInput
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="number-pad"
+              maxLength={8}
+              onChangeText={setMfaCode}
+              placeholder="000000"
+              placeholderTextColor={colors.placeholder}
+              style={styles.input}
+              testID="mobile-login-mfa"
+              value={mfaCode}
+            />
+          </View>
+        ) : (
+          <>
         {tenants.length > 1 ? (
           <View>
             <Text style={styles.label}>Empresa</Text>
@@ -234,6 +266,8 @@ export default function LoginScreen() {
             </Pressable>
           </View>
         </View>
+          </>
+        )}
 
         {error ? <Text style={styles.error}>{error}</Text> : null}
 
@@ -242,8 +276,25 @@ export default function LoginScreen() {
           style={({ pressed }) => [styles.button, pressed && { opacity: 0.88 }]}
           testID="mobile-login-submit"
         >
-          {saving ? <ActivityIndicator color={colors.primaryBtnText} /> : <Text style={styles.buttonText}>Entrar</Text>}
+          {saving ? (
+            <ActivityIndicator color={colors.primaryBtnText} />
+          ) : (
+            <Text style={styles.buttonText}>{mfaPending ? 'Confirmar MFA' : 'Entrar'}</Text>
+          )}
         </Pressable>
+        {mfaPending ? (
+          <Pressable
+            onPress={() => {
+              void cancelMobileMfaLogin();
+              setMfaPending(null);
+              setMfaCode('');
+              setError('');
+            }}
+            style={({ pressed }) => [{ alignItems: 'center', paddingVertical: 12, opacity: pressed ? 0.7 : 1 }]}
+          >
+            <Text style={{ color: colors.textSecondary, fontWeight: '600' }}>Voltar</Text>
+          </Pressable>
+        ) : null}
         <Text style={styles.buildInfo}>{buildLabel}</Text>
       </View>
     </AuthScreenLayout>

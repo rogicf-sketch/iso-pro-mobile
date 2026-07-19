@@ -115,6 +115,8 @@ export function buildAtendimentoStyles(c: ThemeColors) {
       ...neonPrimaryButtonExtras(c),
     },
     btnOff: { opacity: 0.5 },
+    /** Feedback imediato ao toque — evita a sensação de botão «congelado». */
+    btnPressed: { opacity: 0.65, transform: [{ scale: 0.98 }] },
     btnText: { color: c.primaryBtnText, fontWeight: '700', fontSize: 16 },
     btnTextSec: { color: c.id === 'claroSistema' ? c.text : '#e2e8f0', fontWeight: '700', fontSize: 15 },
     meta: { fontSize: 12, color: c.textMuted, marginBottom: 8 },
@@ -161,6 +163,7 @@ export function buildAtendimentoStyles(c: ThemeColors) {
       borderRadius: 10,
       alignItems: 'center',
     },
+    finalizarRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
     scannerWrap: { flex: 1, backgroundColor: '#000', justifyContent: 'center' },
     scannerDenied: { flex: 1, justifyContent: 'center', padding: 24 },
     scannerDeniedTxt: { color: c.modalText, textAlign: 'center', fontSize: 16 },
@@ -230,7 +233,7 @@ export function buildAtendimentoStyles(c: ThemeColors) {
       alignItems: 'center',
       marginBottom: 8,
     },
-    compModalBtnPrintTxt: { color: c.text, fontWeight: '700', fontSize: 16 },
+    compModalBtnPrintTxt: { color: c.compModalBtnPrintText, fontWeight: '800', fontSize: 16 },
     compModalBtnShare: {
       backgroundColor: c.compModalBtnShare,
       paddingVertical: 14,

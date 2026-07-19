@@ -56,6 +56,8 @@ function RootLayoutInner() {
         await runAuthStorageMigration();
         await clearSessionOnFirstLaunchAfterInstall();
         await hydrateActiveTenantId();
+        const { hydrateIsoProJwtSessionFlag } = await import('@/src/lib/isoProJwtSession');
+        await hydrateIsoProJwtSessionFlag();
         const session = await getStoredMobileSession();
         if (cancelled) return;
 

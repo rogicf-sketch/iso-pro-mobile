@@ -32,15 +32,20 @@ function getQuantidadeRecebidaItem(
   return status === 'conferido' ? Number(item.quantidadeConferida ?? 0) : 0;
 }
 
-/**
- * Saldo **operacional** por código, só a partir de **movimentos** no snapshot:
- * recebimentos (conferidos quando aplicável) − soma de `quantidadeAtendida` nos documentos + ajustes de estoque.
- *
- * **Não** usa `materiais[].saldoAtual` explícito: esse campo pode ficar desatualizado na nuvem e fazia o telemóvel
- * mostrar saldo com «pendência no desenho» mesmo sem recebimento — o PC recalcula e bloqueia. O mobile deve seguir
- * a mesma regra de movimento para ficar alinhado ao I.S.O PRO no PC.
- */
-export function buildSaldoOperacionalParaAtendimento(payload: IsoSnapshotPayload): Map<string, number> {
+export type MetricasSaldoOperacional = {
+  recebido: number;
+  atendido: number;
+  estoque: number;
+};
+
+type MapasSaldoOperacional = {
+  recebimentosMap: Map<string, number>;
+  atendidoMap: Map<string, number>;
+  ajustesMap: Map<string, number>;
+  todosCodigos: Set<string>;
+};
+
+function buildMapasSaldoOperacional(payload: IsoSnapshotPayload): MapasSaldoOperacional {
   const recebimentosMap = new Map<string, number>();
   for (const recebimento of payload.recebimentos ?? []) {
     const rec = recebimento as Recebimento & Record<string, unknown>;
@@ -86,16 +91,56 @@ export function buildSaldoOperacionalParaAtendimento(payload: IsoSnapshotPayload
     if (c) todosCodigos.add(c);
   }
 
-  const saldoMap = new Map<string, number>();
-  for (const codigo of todosCodigos) {
-    const saldo = Math.max(
-      0,
-      (recebimentosMap.get(codigo) ?? 0) - (atendidoMap.get(codigo) ?? 0) + (ajustesMap.get(codigo) ?? 0),
-    );
-    saldoMap.set(codigo, saldo);
-  }
+  return { recebimentosMap, atendidoMap, ajustesMap, todosCodigos };
+}
 
+function estoqueOperacionalDeMapas(mapas: MapasSaldoOperacional, codigo: string): number {
+  return Math.max(
+    0,
+    (mapas.recebimentosMap.get(codigo) ?? 0) -
+      (mapas.atendidoMap.get(codigo) ?? 0) +
+      (mapas.ajustesMap.get(codigo) ?? 0),
+  );
+}
+
+/**
+ * Saldo **operacional** por código, só a partir de **movimentos** no snapshot:
+ * recebimentos (conferidos quando aplicável) − soma de `quantidadeAtendida` nos documentos + ajustes de estoque.
+ *
+ * **Não** usa `materiais[].saldoAtual` explícito: esse campo pode ficar desatualizado na nuvem e fazia o telemóvel
+ * mostrar saldo com «pendência no desenho» mesmo sem recebimento — o PC recalcula e bloqueia. O mobile deve seguir
+ * a mesma regra de movimento para ficar alinhado ao I.S.O PRO no PC.
+ */
+export function buildSaldoOperacionalParaAtendimento(payload: IsoSnapshotPayload): Map<string, number> {
+  const mapas = buildMapasSaldoOperacional(payload);
+  const saldoMap = new Map<string, number>();
+  for (const codigo of mapas.todosCodigos) {
+    saldoMap.set(codigo, estoqueOperacionalDeMapas(mapas, codigo));
+  }
   return saldoMap;
+}
+
+/** Recebido, atendido e estoque operacional por código — usado no inventário mobile. */
+export function buildMetricasOperacionaisPorCodigo(payload: IsoSnapshotPayload): Map<string, MetricasSaldoOperacional> {
+  const mapas = buildMapasSaldoOperacional(payload);
+  const out = new Map<string, MetricasSaldoOperacional>();
+  for (const codigo of mapas.todosCodigos) {
+    out.set(codigo, {
+      recebido: mapas.recebimentosMap.get(codigo) ?? 0,
+      atendido: mapas.atendidoMap.get(codigo) ?? 0,
+      estoque: estoqueOperacionalDeMapas(mapas, codigo),
+    });
+  }
+  return out;
+}
+
+export function getMetricasOperacionaisCodigo(
+  payload: IsoSnapshotPayload,
+  codigoMaterial: string,
+): MetricasSaldoOperacional | null {
+  const codigo = codigoMaterialKey(codigoMaterial);
+  if (!codigo) return null;
+  return buildMetricasOperacionaisPorCodigo(payload).get(codigo) ?? null;
 }
 
 /** @deprecated Use `buildSaldoOperacionalParaAtendimento` — mantido como alias para não inflar com saldo explícito. */

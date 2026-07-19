@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { IsoSnapshotPayload, Recebimento } from 'iso-pro-shared';
-import { buildSaldoOperacionalParaAtendimento, codigoMaterialKey, getSaldoCodigo } from './saldoMaterial';
+import { buildSaldoOperacionalParaAtendimento, buildMetricasOperacionaisPorCodigo, codigoMaterialKey, getSaldoCodigo } from './saldoMaterial';
 
 describe('codigoMaterialKey', () => {
   it('normaliza para maiúsculas e trim', () => {
@@ -104,5 +104,26 @@ describe('buildSaldoOperacionalParaAtendimento', () => {
       materiais: [],
     };
     expect(buildSaldoOperacionalParaAtendimento(payload).get('M1')).toBe(0);
+  });
+});
+
+describe('buildMetricasOperacionaisPorCodigo', () => {
+  it('expõe recebido, atendido e estoque por código', () => {
+    const payload: IsoSnapshotPayload = {
+      recebimentos: [
+        { id: 'r1', modoRecebimento: 'direto', itens: [{ codigo: 'M1', quantidade: 100 }] },
+      ],
+      documentos: [
+        {
+          id: 'd1',
+          numero: 'PL-1',
+          revisao: 'A',
+          itens: [{ id: 'i1', codigo: 'M1', descricao: 'X', quantidade: 50, quantidadeAtendida: 30, unidade: 'UN' }],
+        },
+      ],
+      materiais: [],
+    };
+    const m = buildMetricasOperacionaisPorCodigo(payload).get('M1');
+    expect(m).toEqual({ recebido: 100, atendido: 30, estoque: 70 });
   });
 });

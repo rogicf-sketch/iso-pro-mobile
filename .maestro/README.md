@@ -26,3 +26,7 @@ maestro test .maestro/login-com-credenciais.yaml
 (PowerShell: `$env:MAESTRO_LOGIN="..."; $env:MAESTRO_PASSWORD="..."; maestro test ...`)
 
 O ficheiro `login-com-credenciais.yaml` espera aparecer o separador **Início** após login bem-sucedido (ecrã `(tabs)`). Ajuste se o rótulo mudar.
+
+## Observabilidade
+
+Com `EXPO_PUBLIC_SENTRY_DSN` definido, o app emite eventos `iso.snapshot_conflict` e `iso.offline_flush` (além de excepções). Sem DSN, só há log local.

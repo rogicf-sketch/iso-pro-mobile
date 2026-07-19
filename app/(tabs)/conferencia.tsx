@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useFocusEffect } from 'expo-router';
 import { useNavigation } from '@react-navigation/native';
+import { CloudSyncStrip } from '@/src/components/mobile/CloudSyncStrip';
+import { EmptyStatePanel } from '@/src/components/mobile/EmptyStatePanel';
+import { ModuleScreenHeader } from '@/src/components/mobile/ModuleScreenHeader';
+import { PrimaryActionButton } from '@/src/components/mobile/PrimaryActionButton';
+import { StatPillRow } from '@/src/components/mobile/StatPillRow';
+import { buildMobileShellStyles } from '@/src/theme/buildMobileShellStyles';
 import { buildConferenciaStyles } from '@/src/theme/buildConferenciaStyles';
 import { useMobileUiPreferences } from '@/src/theme/MobileUiPreferencesContext';
 import { useTheme } from '@/src/theme/ThemeContext';
@@ -26,12 +32,28 @@ import {
 } from '@/src/lib/recebimentoBusca';
 import {
   linhaEstadoConferenciaMobile,
+  listarRecebimentosPendentesConferencia,
   recebimentoPermiteEditarConferencia,
 } from '@/src/lib/recebimentoConferenciaMobile';
-import { fetchDefaultSnapshot } from '@/src/lib/snapshot';
-import { commitDefaultSnapshotWriteResilient as commitDefaultSnapshotWrite } from '@/src/lib/offlineSnapshotQueue';
+import {
+  listRecebimentosPageFromCloud,
+  readRecebimentoFromCloud,
+  syncRecebimentosFromSnapshotCloud,
+} from '@/src/lib/escalaCloud';
+import {
+  wireRecebimentoDetalheEscala,
+  wireRecebimentoListaEscala,
+} from '@/src/lib/recebimentoEscalaWire';
+import { buildSnapshotPatchFromNext, fetchSnapshotSlices } from '@/src/lib/snapshot';
+import { commitDefaultSnapshotPatchWriteResilient as commitDefaultSnapshotWrite } from '@/src/lib/offlineSnapshotQueue';
+import { createSnapshotPatchPrepareWithBaseline } from '@/src/lib/snapshotWritePrepare';
+import {
+  SNAPSHOT_MOBILE_CONFERENCIA_MERGE_KEYS,
+  SNAPSHOT_MOBILE_CONFERENCIA_PATCH_KEYS,
+  SNAPSHOT_MOBILE_CONFERENCIA_READ_KEYS,
+  SNAPSHOT_MOBILE_CONFERENCIA_WRITE_READ_KEYS,
+} from '@/src/lib/snapshotSliceKeys';
 import { hasSupabaseConfig } from '@/src/lib/config';
-import { formatarDataHoraLocal } from '@/src/lib/formatData';
 import {
   analisarDivergenciasAposFinalizar,
   linhaComDivergenciaVisual,
@@ -52,6 +74,7 @@ import {
   salvarRascunhoConferencia,
 } from '@/src/lib/conferenciaRascunhoStorage';
 import { registerConferenciaSessaoGate } from '@/src/lib/conferenciaSessaoGate';
+import { useSnapshotRefreshOnAppActive } from '@/src/lib/useSnapshotRefreshOnAppActive';
 import { useDebouncedEffect } from '@/src/lib/useDebouncedEffect';
 import type { IsoSnapshotPayload, Recebimento, RecebimentoItem } from 'iso-pro-shared';
 
@@ -74,11 +97,53 @@ function mesmoRecebimentoConferencia(selecionado: Recebimento | null, linha: Rec
   return String(selecionado.id) === String(linha.id);
 }
 
+/** Alinha o rascunho local com linhas atualizadas do servidor (snapshot ou detalhe RPC). */
+function mergeRecComPayload(draftRec: Recebimento, p: IsoSnapshotPayload): Recebimento {
+  const server = p.recebimentos?.find((r) => String(r.id) === String(draftRec.id));
+  if (!server) return deepClone(draftRec);
+  const merged = deepClone(server);
+  const draftItens = draftRec.itens || [];
+  (merged.itens || []).forEach((it, i) => {
+    const d = draftItens[i];
+    if (d && it) {
+      it.quantidadeConferida = d.quantidadeConferida;
+      const obs = d.observacaoItem;
+      if (obs !== undefined && obs !== null && String(obs).trim() !== '') {
+        it.observacaoItem = String(obs).trim();
+      } else {
+        delete it.observacaoItem;
+      }
+      const loc = locLinhaNormalizada(d);
+      if (loc) {
+        it.localizacao = loc;
+      } else {
+        delete it.localizacao;
+      }
+    }
+  });
+  return merged;
+}
+
+function upsertRecebimentoNoPayload(p: IsoSnapshotPayload, full: Recebimento): IsoSnapshotPayload {
+  const list = [...(p.recebimentos ?? [])];
+  const idx = list.findIndex((r) => String(r.id) === String(full.id));
+  if (idx >= 0) list[idx] = full;
+  else list.push(full);
+  return { ...p, recebimentos: list };
+}
+
+const PAGE_SIZE_CONFERENCIA = 50;
+
+function textoBuscaRecebimento(r: Recebimento): string {
+  return String(r.nota ?? r.romaneio ?? r.fornecedorNome ?? '').trim();
+}
+
 export default function ConferenciaScreen() {
   const navigation = useNavigation();
   const { colors } = useTheme();
   const { mostrarTextosAjudaModulos } = useMobileUiPreferences();
   const styles = useMemo(() => buildConferenciaStyles(colors), [colors]);
+  const shell = useMemo(() => buildMobileShellStyles(colors), [colors]);
   const configured = useMemo(() => hasSupabaseConfig(), []);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -86,6 +151,10 @@ export default function ConferenciaScreen() {
   const [nuvemAt, setNuvemAt] = useState<string | null>(null);
 
   const [payload, setPayload] = useState<IsoSnapshotPayload | null>(null);
+  const [recsCloud, setRecsCloud] = useState<Recebimento[]>([]);
+  const [recsTotal, setRecsTotal] = useState(0);
+  const [recsEscalaOk, setRecsEscalaOk] = useState(false);
+  const syncRecsTentadoRef = useRef(false);
   const [nfBusca, setNfBusca] = useState('');
   const [rec, setRec] = useState<Recebimento | null>(null);
   const [buscaMsg, setBuscaMsg] = useState<string | null>(null);
@@ -99,13 +168,17 @@ export default function ConferenciaScreen() {
   const [obsModalIndex, setObsModalIndex] = useState<number | null>(null);
   const [obsModalDraft, setObsModalDraft] = useState('');
 
+  const listaRecebimentosAtiva = useMemo(() => {
+    if (recsEscalaOk) return recsCloud;
+    return (payload?.recebimentos as Recebimento[] | undefined) ?? [];
+  }, [recsEscalaOk, recsCloud, payload?.recebimentos]);
+
   const recFiltradosRapido = useMemo(() => {
-    const list = payload?.recebimentos as Recebimento[] | undefined;
-    if (!list?.length) return [];
+    if (!listaRecebimentosAtiva.length) return [];
     const t = nfBusca.trim();
     if (t.length < 1) return [];
-    return filtrarRecebimentosPorTextoInteligente(list, nfBusca, 50);
-  }, [payload?.recebimentos, nfBusca]);
+    return filtrarRecebimentosPorTextoInteligente(listaRecebimentosAtiva, nfBusca, 50);
+  }, [listaRecebimentosAtiva, nfBusca]);
 
   /** Com recebimento escolhido, a lista mostra só essa linha (igual Documentos / Consulta). */
   const recFiltradosParaExibir = useMemo(() => {
@@ -131,28 +204,143 @@ export default function ConferenciaScreen() {
     if (rec) {
       return 'Recebimento em conferência — altere o texto acima para voltar a ver todos os resultados filtrados';
     }
+    if (recsEscalaOk && nfBusca.trim()) {
+      return `Resultados (${listaBuscaUnificada.length} de ${recsTotal}) — toque para abrir`;
+    }
     return `Resultados ao digitar (${listaBuscaUnificada.length}${listaBuscaUnificada.length >= 50 ? '+' : ''}) — toque para abrir`;
-  }, [candidatosRec, rec, listaBuscaUnificada.length]);
+  }, [candidatosRec, rec, listaBuscaUnificada.length, recsEscalaOk, nfBusca, recsTotal]);
 
-  const carregarNuvem = useCallback(async () => {
-    setLoadErr(null);
-    setBuscaMsg(null);
-    setRec(null);
-    setCandidatosRec(null);
-    setLoading(true);
+  const recPendentesConferencia = useMemo(
+    () => listarRecebimentosPendentesConferencia(listaRecebimentosAtiva),
+    [listaRecebimentosAtiva],
+  );
+
+  const mostrarListaPendentes = Boolean(payload && !rec && nfBusca.trim().length === 0);
+
+  const carregarPaginaRecebimentos = useCallback(async (busca: string) => {
+    const q = busca.trim();
     try {
-      const { payload: p, updatedAt, error } = await fetchDefaultSnapshot();
+      let page = await listRecebimentosPageFromCloud({
+        busca: q || undefined,
+        offset: 0,
+        limit: PAGE_SIZE_CONFERENCIA,
+        modo: 'aguardando_conferencia',
+      });
+
+      if (!page.missing && page.total === 0 && !q && !syncRecsTentadoRef.current) {
+        syncRecsTentadoRef.current = true;
+        const sync = await syncRecebimentosFromSnapshotCloud();
+        if (sync.ok) {
+          page = await listRecebimentosPageFromCloud({
+            busca: q || undefined,
+            offset: 0,
+            limit: PAGE_SIZE_CONFERENCIA,
+            modo: 'aguardando_conferencia',
+          });
+        }
+      }
+
+      if (page.missing) {
+        setRecsEscalaOk(false);
+        return false;
+      }
+      setRecsEscalaOk(true);
+      const next = page.recebimentos.map(wireRecebimentoListaEscala);
+      // Preserva a identidade do array quando nada mudou — sem isto, cada recarga
+      // dispara os efeitos que dependem da lista e a tela entra em loop de refresh.
+      setRecsCloud((prev) => {
+        if (
+          prev.length === next.length &&
+          prev.every((r, i) => {
+            const n = next[i];
+            return (
+              !!n &&
+              String(r.id) === String(n.id) &&
+              String(r.statusConferencia ?? '') === String(n.statusConferencia ?? '') &&
+              String(r.dataConferencia ?? '') === String(n.dataConferencia ?? '')
+            );
+          })
+        ) {
+          return prev;
+        }
+        return next;
+      });
+      setRecsTotal(page.total);
+      if (page.error) setBuscaMsg(page.error);
+      return true;
+    } catch (e) {
+      setRecsEscalaOk(false);
+      setBuscaMsg(e instanceof Error ? e.message : 'Falha ao listar recebimentos.');
+      return false;
+    }
+  }, []);
+
+  const hidratarRecebimentoConferencia = useCallback(async (escolhido: Recebimento) => {
+    try {
+      const cloud = await readRecebimentoFromCloud(String(escolhido.id));
+      if (cloud.recebimento) {
+        const full = wireRecebimentoDetalheEscala(cloud.recebimento, String(escolhido.id));
+        setPayload((prev) => (prev ? upsertRecebimentoNoPayload(prev, full) : { recebimentos: [full] }));
+        return full;
+      }
+    } catch {
+      /* mantém resumo */
+    }
+    return escolhido;
+  }, []);
+
+  /** `rec` via ref: mantém `carregarNuvem` estável — com `rec` nas deps, o `useFocusEffect`
+   * re-executava a cada tecla digitada na conferência (recarga infinita, tela «a tremer»). */
+  const recAtualRef = useRef<Recebimento | null>(null);
+  recAtualRef.current = rec;
+
+  const carregarNuvem = useCallback(async (opts?: { preservarSelecao?: boolean }) => {
+    const recAtual = recAtualRef.current;
+    const recIdPreservar = opts?.preservarSelecao && recAtual ? String(recAtual.id) : null;
+    const recLocalPreservar = opts?.preservarSelecao && recAtual ? deepClone(recAtual) : null;
+
+    if (!opts?.preservarSelecao) {
+      setBuscaMsg(null);
+      setRec(null);
+      setCandidatosRec(null);
+    }
+    setLoadErr(null);
+    setLoading(true);
+    syncRecsTentadoRef.current = false;
+    try {
+      const { payload: p, updatedAt, error } = await fetchSnapshotSlices(SNAPSHOT_MOBILE_CONFERENCIA_READ_KEYS);
       if (error) {
         setLoadErr(error);
         setPayload(null);
+        setRecsCloud([]);
+        setRecsTotal(0);
+        setRecsEscalaOk(false);
         return;
       }
-      setPayload(p ? deepClone(p) : null);
+      const cloned = p ? deepClone(p) : null;
+      setPayload(cloned);
       setNuvemAt(updatedAt);
+
+      const escalaOk = await carregarPaginaRecebimentos('');
+      if (!escalaOk) {
+        // Fallback legado: fatia completa de recebimentos
+        const full = await fetchSnapshotSlices(['recebimentos', ...SNAPSHOT_MOBILE_CONFERENCIA_READ_KEYS]);
+        if (!full.error && full.payload) {
+          setPayload(deepClone(full.payload));
+          setNuvemAt(full.updatedAt);
+        }
+      }
+
+      if (recIdPreservar && recLocalPreservar) {
+        const full = await hidratarRecebimentoConferencia(recLocalPreservar);
+        setRec(mergeRecComPayload(recLocalPreservar, {
+          recebimentos: [full],
+        }));
+      }
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [carregarPaginaRecebimentos, hidratarRecebimentoConferencia]);
 
   /** Sempre fixa o recebimento na lista (um cartão), como Documentos; avisos só no detalhe. */
   const abrirRecebimentoSeConferivel = useCallback((escolhido: Recebimento) => {
@@ -171,58 +359,116 @@ export default function ConferenciaScreen() {
     setBuscaMsg(null);
   }, []);
 
+  const abrirRecebimentoDaLista = useCallback(
+    (escolhido: Recebimento) => {
+      const busca = textoBuscaRecebimento(escolhido);
+      if (busca) setNfBusca(busca);
+      void (async () => {
+        const full = await hidratarRecebimentoConferencia(escolhido);
+        abrirRecebimentoSeConferivel(full);
+      })();
+    },
+    [abrirRecebimentoSeConferivel, hidratarRecebimentoConferencia],
+  );
+
   const buscarRecebimento = useCallback(() => {
     setBuscaMsg(null);
     setCandidatosRec(null);
-    if (!payload?.recebimentos?.length) {
-      setBuscaMsg('Carregue os dados da nuvem primeiro.');
-      return;
-    }
-    const lista = payload.recebimentos as Recebimento[];
     const raw = nfBusca.trim();
     if (!raw) {
       setBuscaMsg('Informe NF, romaneio, fornecedor, código do material ou trecho para pesquisa.');
       return;
     }
-    const res = resolverBuscaRecebimentoPorNota(lista, nfBusca);
-    if (res.kind === 'none') {
+    void (async () => {
+      if (recsEscalaOk) {
+        const page = await listRecebimentosPageFromCloud({
+          busca: raw,
+          offset: 0,
+          limit: PAGE_SIZE_CONFERENCIA,
+          modo: 'aguardando_conferencia',
+        });
+        const lista = page.missing
+          ? listaRecebimentosAtiva
+          : page.recebimentos.map(wireRecebimentoListaEscala);
+        if (!page.missing) {
+          setRecsCloud(lista);
+          setRecsTotal(page.total);
+          setRecsEscalaOk(true);
+        }
+        const res = resolverBuscaRecebimentoPorNota(lista, nfBusca);
+        if (res.kind === 'none') {
+          setRec(null);
+          setBuscaMsg(`Nenhum recebimento combina com «${raw}».`);
+          return;
+        }
+        if (res.kind === 'one') {
+          const full = await hidratarRecebimentoConferencia(res.rec);
+          abrirRecebimentoSeConferivel(full);
+          return;
+        }
+        if (res.kind === 'sameNotaVarios') {
+          setBuscaMsg(`${res.recs.length} recebimentos com a mesma NF — abrindo o primeiro.`);
+          const full = await hidratarRecebimentoConferencia(res.recs[0]!);
+          abrirRecebimentoSeConferivel(full);
+          return;
+        }
+        setRec(null);
+        setCandidatosRec(res.recs);
+        setBuscaMsg(`${res.recs.length} recebimentos correspondem — toque numa linha para conferir.`);
+        return;
+      }
+
+      if (!listaRecebimentosAtiva.length) {
+        setBuscaMsg('Carregue os dados da nuvem primeiro.');
+        return;
+      }
+      const lista = listaRecebimentosAtiva;
+      const res = resolverBuscaRecebimentoPorNota(lista, nfBusca);
+      if (res.kind === 'none') {
+        setRec(null);
+        const ex = exemplosNotasRecebimentos(lista, 6);
+        setBuscaMsg(
+          ex.length
+            ? `Nenhum recebimento combina com «${raw}». Exemplos de NF: ${ex.join(' · ')}.`
+            : 'Nenhum recebimento encontrado.',
+        );
+        return;
+      }
+      if (res.kind === 'one') {
+        abrirRecebimentoSeConferivel(res.rec);
+        return;
+      }
+      if (res.kind === 'sameNotaVarios') {
+        setBuscaMsg(`${res.recs.length} recebimentos com a mesma NF — abrindo o primeiro.`);
+        abrirRecebimentoSeConferivel(res.recs[0]!);
+        return;
+      }
       setRec(null);
-      const ex = exemplosNotasRecebimentos(lista, 6);
-      setBuscaMsg(
-        ex.length
-          ? `Nenhum recebimento combina com «${raw}». Exemplos de NF: ${ex.join(' · ')}.`
-          : 'Nenhum recebimento encontrado.',
-      );
-      return;
-    }
-    if (res.kind === 'one') {
-      abrirRecebimentoSeConferivel(res.rec);
-      return;
-    }
-    if (res.kind === 'sameNotaVarios') {
-      setBuscaMsg(`${res.recs.length} recebimentos com a mesma NF — abrindo o primeiro.`);
-      abrirRecebimentoSeConferivel(res.recs[0]);
-      return;
-    }
-    setRec(null);
-    setCandidatosRec(res.recs);
-    setBuscaMsg(`${res.recs.length} recebimentos correspondem — toque numa linha para conferir.`);
-  }, [abrirRecebimentoSeConferivel, nfBusca, payload]);
+      setCandidatosRec(res.recs);
+      setBuscaMsg(`${res.recs.length} recebimentos correspondem — toque numa linha para conferir.`);
+    })();
+  }, [
+    abrirRecebimentoSeConferivel,
+    hidratarRecebimentoConferencia,
+    listaRecebimentosAtiva,
+    nfBusca,
+    recsEscalaOk,
+  ]);
 
   const tentarAutoBuscaConferencia = useCallback(() => {
-    if (!payload?.recebimentos?.length) return;
-    const lista = payload.recebimentos as Recebimento[];
+    if (!listaRecebimentosAtiva.length) return;
+    const lista = listaRecebimentosAtiva;
     const raw = nfBusca.trim();
     if (raw.length < 2) return;
     /** Não repetir a resolução automática por cima de uma seleção já feita (o debounce limpava `rec` em «escolher»). */
     if (rec) return;
     const res = resolverBuscaRecebimentoPorNota(lista, nfBusca);
     if (res.kind === 'one') {
-      abrirRecebimentoSeConferivel(res.rec);
+      void hidratarRecebimentoConferencia(res.rec).then(abrirRecebimentoSeConferivel);
       return;
     }
     if (res.kind === 'sameNotaVarios') {
-      abrirRecebimentoSeConferivel(res.recs[0]);
+      void hidratarRecebimentoConferencia(res.recs[0]!).then(abrirRecebimentoSeConferivel);
       return;
     }
     if (res.kind === 'escolher') {
@@ -234,24 +480,55 @@ export default function ConferenciaScreen() {
     setRec(null);
     setCandidatosRec(null);
     setBuscaMsg(null);
-  }, [abrirRecebimentoSeConferivel, nfBusca, payload, rec]);
+  }, [abrirRecebimentoSeConferivel, hidratarRecebimentoConferencia, listaRecebimentosAtiva, nfBusca, rec]);
+
+  /** Refs para o debounce abaixo: deps estáveis (só `nfBusca`/`recsEscalaOk`) para não
+   * re-disparar a cada recarga da lista — era isso que deixava a tela «a tremer» sozinha. */
+  const carregarPaginaRecebimentosRef = useRef(carregarPaginaRecebimentos);
+  carregarPaginaRecebimentosRef.current = carregarPaginaRecebimentos;
+  const tentarAutoBuscaConferenciaRef = useRef(tentarAutoBuscaConferencia);
+  tentarAutoBuscaConferenciaRef.current = tentarAutoBuscaConferencia;
+  const prevNfBuscaRef = useRef('');
 
   /** Pesquisa ao digitar: após pausa, com ≥2 caracteres. */
   useDebouncedEffect(
     () => {
-      if (!payload?.recebimentos?.length) return;
       const raw = nfBusca.trim();
+      const prev = prevNfBuscaRef.current;
+      prevNfBuscaRef.current = raw;
       if (raw.length < 2) {
-        setRec(null);
-        setBuscaMsg(null);
-        setCandidatosRec(null);
+        // Só limpa/recarrega quando o utilizador apagou a pesquisa (não no arranque nem em loop).
+        if (prev.length >= 2) {
+          setCandidatosRec(null);
+          setBuscaMsg(null);
+          if (recsEscalaOk) void carregarPaginaRecebimentosRef.current('');
+        }
         return;
       }
-      tentarAutoBuscaConferencia();
+      if (recsEscalaOk) {
+        void (async () => {
+          await carregarPaginaRecebimentosRef.current(raw);
+          tentarAutoBuscaConferenciaRef.current();
+        })();
+        return;
+      }
+      tentarAutoBuscaConferenciaRef.current();
     },
-    [nfBusca, payload, tentarAutoBuscaConferencia],
+    [nfBusca, recsEscalaOk],
     420,
   );
+
+  useFocusEffect(
+    useCallback(() => {
+      void carregarNuvem({ preservarSelecao: true });
+    }, [carregarNuvem]),
+  );
+
+  const refreshAoVoltarAtivo = useCallback(
+    () => carregarNuvem({ preservarSelecao: true }),
+    [carregarNuvem],
+  );
+  useSnapshotRefreshOnAppActive(refreshAoVoltarAtivo);
 
   useEffect(() => {
     if (!rec?.itens) {
@@ -331,43 +608,18 @@ export default function ConferenciaScreen() {
 
   const mergeRecNoPayload = useCallback(
     (atualizado: Recebimento): IsoSnapshotPayload | null => {
-      if (!payload?.recebimentos) return null;
+      if (!payload) return null;
       const next = deepClone(payload);
-      const idx = next.recebimentos!.findIndex((r) => String(r.id) === String(atualizado.id));
-      if (idx === -1) return null;
-      next.recebimentos![idx] = atualizado;
+      const list = [...(next.recebimentos ?? [])];
+      const idx = list.findIndex((r) => String(r.id) === String(atualizado.id));
+      if (idx === -1) list.push(atualizado);
+      else list[idx] = atualizado;
+      next.recebimentos = list;
       next.dataAtualizacao = new Date().toISOString();
       return next;
     },
-    [payload]
+    [payload],
   );
-
-  /** Alinha o rascunho local com linhas atualizadas do snapshot (após «Carregar nuvem»). */
-  const mergeRecComPayload = useCallback((draftRec: Recebimento, p: IsoSnapshotPayload): Recebimento => {
-    const server = p.recebimentos?.find((r) => String(r.id) === String(draftRec.id));
-    if (!server) return deepClone(draftRec);
-    const merged = deepClone(server);
-    const draftItens = draftRec.itens || [];
-    (merged.itens || []).forEach((it, i) => {
-      const d = draftItens[i];
-      if (d && it) {
-        it.quantidadeConferida = d.quantidadeConferida;
-        const obs = d.observacaoItem;
-        if (obs !== undefined && obs !== null && String(obs).trim() !== '') {
-          it.observacaoItem = String(obs).trim();
-        } else {
-          delete it.observacaoItem;
-        }
-        const loc = locLinhaNormalizada(d);
-        if (loc) {
-          it.localizacao = loc;
-        } else {
-          delete it.localizacao;
-        }
-      }
-    });
-    return merged;
-  }, []);
 
   const persistirRascunhoDispositivo = useCallback(async () => {
     if (!rec || !recebimentoPermiteEditarConferencia(rec)) return;
@@ -387,27 +639,44 @@ export default function ConferenciaScreen() {
         appAlert('Indisponível', 'Só é possível guardar quantidades em recebimentos «aguardando conferência» ainda não finalizados.');
         return false;
       }
+      if (!payload || !nuvemAt) {
+        appAlert('Supabase', 'Carregue os dados da nuvem antes de guardar.');
+        return false;
+      }
       setSaving(true);
       try {
-        const result = await commitDefaultSnapshotWrite(async () => {
-          const { payload: fresh, updatedAt, error } = await fetchDefaultSnapshot();
-          if (error) {
-            throw new Error(error);
-          }
-          if (!fresh?.recebimentos?.length) {
-            throw new Error('Não foi possível atualizar o recebimento no pacote.');
-          }
-          const next = deepClone(fresh);
-          const idx = next.recebimentos!.findIndex((r) => String(r.id) === String(rec.id));
-          if (idx === -1) {
-            throw new Error('Não foi possível atualizar o recebimento no pacote.');
-          }
-          const recGravar = deepClone(rec);
-          normalizarLocalizacaoItensRecebimento(recGravar.itens);
-          next.recebimentos![idx] = recGravar;
-          next.dataAtualizacao = new Date().toISOString();
-          return { nextPayload: next, baselineUpdatedAt: updatedAt };
-        });
+        // baseline null: força leitura fresca com WRITE_READ_KEYS (inclui recebimentos[]).
+        // O ecrã só carrega materiais/colaboradores — usar esse payload como baseline
+        // fazia o patch substituir a lista inteira por [1 NF] (incidente 2026-07-18).
+        const result = await commitDefaultSnapshotWrite(
+          createSnapshotPatchPrepareWithBaseline(
+            null,
+            SNAPSHOT_MOBILE_CONFERENCIA_WRITE_READ_KEYS,
+            (fresh) => {
+              const recGravar = deepClone(rec);
+              normalizarLocalizacaoItensRecebimento(recGravar.itens);
+              const next = deepClone(fresh);
+              const list = [...(next.recebimentos ?? [])];
+              const idx = list.findIndex((r) => String(r.id) === String(rec.id));
+              if (idx === -1) list.push(recGravar);
+              else list[idx] = recGravar;
+              next.recebimentos = list;
+              next.dataAtualizacao = new Date().toISOString();
+              return {
+                patch: {
+                  recebimentos: [recGravar],
+                  dataAtualizacao: next.dataAtualizacao,
+                },
+                mergeKeys: SNAPSHOT_MOBILE_CONFERENCIA_MERGE_KEYS,
+                patchWithoutMerge: buildSnapshotPatchFromNext(
+                  next,
+                  SNAPSHOT_MOBILE_CONFERENCIA_PATCH_KEYS,
+                ),
+              };
+            },
+          ),
+          { offlineTag: 'conferencia-guardar' },
+        );
         if (result.error) {
           appAlert(result.conflict ? 'Conflito de dados' : 'Supabase', result.error);
           if (result.conflict) {
@@ -442,7 +711,7 @@ export default function ConferenciaScreen() {
         setSaving(false);
       }
     },
-    [carregarNuvem, mergeRecNoPayload, rec],
+    [carregarNuvem, mergeRecNoPayload, nuvemAt, payload, rec],
   );
 
   const finalizarConferencia = useCallback(() => {
@@ -458,6 +727,10 @@ export default function ConferenciaScreen() {
     const div = analisarDivergenciasAposFinalizar(rec);
 
     const executarGravacaoFinal = async () => {
+      if (!payload || !nuvemAt) {
+        appAlert('Supabase', 'Carregue os dados da nuvem antes de finalizar.');
+        return;
+      }
       const r = deepClone(rec);
       normalizarLocalizacaoItensRecebimento(r.itens);
       r.statusConferencia = 'conferido';
@@ -477,23 +750,34 @@ export default function ConferenciaScreen() {
       });
       setSaving(true);
       try {
-        const result = await commitDefaultSnapshotWrite(async () => {
-          const { payload: fresh, updatedAt, error } = await fetchDefaultSnapshot();
-          if (error) {
-            throw new Error(error);
-          }
-          if (!fresh?.recebimentos?.length) {
-            throw new Error('Falha ao montar o payload.');
-          }
-          const next = deepClone(fresh);
-          const idx = next.recebimentos!.findIndex((x) => String(x.id) === String(r.id));
-          if (idx === -1) {
-            throw new Error('Falha ao montar o payload.');
-          }
-          next.recebimentos![idx] = deepClone(r);
-          next.dataAtualizacao = new Date().toISOString();
-          return { nextPayload: next, baselineUpdatedAt: updatedAt };
-        });
+        const result = await commitDefaultSnapshotWrite(
+          createSnapshotPatchPrepareWithBaseline(
+            null,
+            SNAPSHOT_MOBILE_CONFERENCIA_WRITE_READ_KEYS,
+            (fresh) => {
+              const recGravar = deepClone(r);
+              const next = deepClone(fresh);
+              const list = [...(next.recebimentos ?? [])];
+              const idx = list.findIndex((x) => String(x.id) === String(r.id));
+              if (idx === -1) list.push(recGravar);
+              else list[idx] = recGravar;
+              next.recebimentos = list;
+              next.dataAtualizacao = new Date().toISOString();
+              return {
+                patch: {
+                  recebimentos: [recGravar],
+                  dataAtualizacao: next.dataAtualizacao,
+                },
+                mergeKeys: SNAPSHOT_MOBILE_CONFERENCIA_MERGE_KEYS,
+                patchWithoutMerge: buildSnapshotPatchFromNext(
+                  next,
+                  SNAPSHOT_MOBILE_CONFERENCIA_PATCH_KEYS,
+                ),
+              };
+            },
+          ),
+          { offlineTag: 'conferencia-finalizar' },
+        );
         if (result.error) {
           appAlert(result.conflict ? 'Conflito de dados' : 'Supabase', result.error);
           if (result.conflict) {
@@ -510,7 +794,12 @@ export default function ConferenciaScreen() {
           setNuvemAt(result.updatedAt);
         }
         void limparRascunhoConferencia();
-        if (div.tem) {
+        if (result.queued) {
+          appAlert(
+            'Finalizado (pendente)',
+            'Conferência guardada neste aparelho e enfileirada para sincronizar com a nuvem.',
+          );
+        } else if (div.tem) {
           appAlert(
             'Conferência finalizada — lembrete',
             'Houve divergências (itens não recebidos ou parciais). No I.S.O PRO desktop, abra o recebimento: as linhas com diferença aparecem em destaque vermelho. Registe o motivo nas observações, se for política da obra.',
@@ -546,7 +835,7 @@ export default function ConferenciaScreen() {
     } else {
       abrirConfirmacaoStock();
     }
-  }, [carregarNuvem, mergeRecNoPayload, rec]);
+  }, [carregarNuvem, mergeRecNoPayload, nuvemAt, payload, rec]);
 
   const podeEditarConferenciaRec = useMemo(() => recebimentoPermiteEditarConferencia(rec), [rec]);
 
@@ -581,18 +870,21 @@ export default function ConferenciaScreen() {
 
   const rascunhoVerificadoParaSnapshotRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!payload?.recebimentos?.length || !nuvemAt) return;
+    if (!payload || !nuvemAt) return;
     if (rascunhoVerificadoParaSnapshotRef.current === nuvemAt) return;
     rascunhoVerificadoParaSnapshotRef.current = nuvemAt;
     void (async () => {
       const draft = await lerRascunhoConferencia();
       if (!draft) return;
-      const exists = payload.recebimentos!.some((r) => String(r.id) === draft.recebimentoId);
-      if (!exists) {
-        await limparRascunhoConferencia();
-        return;
+      const inLista = listaRecebimentosAtiva.some((r) => String(r.id) === draft.recebimentoId);
+      const inSparse = payload.recebimentos?.some((r) => String(r.id) === draft.recebimentoId);
+      if (!inLista && !inSparse) {
+        const cloud = await readRecebimentoFromCloud(draft.recebimentoId);
+        if (!cloud.recebimento) {
+          await limparRascunhoConferencia();
+          return;
+        }
       }
-      const p = payload;
       appAlert(
         'Rascunho de conferência',
         `Encontrámos quantidades guardadas neste telemóvel para um recebimento em conferência (${draft.rec.nota ?? draft.rec.romaneio ?? '—'}). Deseja continuar de onde parou?`,
@@ -605,18 +897,21 @@ export default function ConferenciaScreen() {
           {
             text: 'Restaurar',
             onPress: () => {
-              const merged = mergeRecComPayload(draft.rec, p);
-              setNfBusca(draft.nfBusca);
-              setRec(merged);
-              setQtdConfTextoPorLinha(draft.qtdConfTextoPorLinha);
-              setBuscaMsg(null);
-              setCandidatosRec(null);
+              void (async () => {
+                const full = await hidratarRecebimentoConferencia(draft.rec);
+                const merged = mergeRecComPayload(draft.rec, { recebimentos: [full] });
+                setNfBusca(draft.nfBusca);
+                setRec(merged);
+                setQtdConfTextoPorLinha(draft.qtdConfTextoPorLinha);
+                setBuscaMsg(null);
+                setCandidatosRec(null);
+              })();
             },
           },
         ],
       );
     })();
-  }, [payload, nuvemAt, mergeRecComPayload]);
+  }, [payload, nuvemAt, listaRecebimentosAtiva, hidratarRecebimentoConferencia]);
 
   useEffect(() => {
     registerConferenciaSessaoGate({
@@ -682,40 +977,100 @@ export default function ConferenciaScreen() {
 
   return (
     <>
-    <ScrollView style={styles.scroll} contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
-      <Text style={styles.title}>Conferência de materiais</Text>
-      {mostrarTextosAjudaModulos ? (
-        <Text style={styles.hint}>
-          Carrega o snapshot da nuvem, busca por NF, romaneio, fornecedor ou código de material nas linhas do recebimento e regista as
-          quantidades conferidas. Modo só para recebimentos em “aguardando conferência”. O telemóvel guarda um rascunho enquanto conferes; use
-          «Guardar quantidades conferidas» para gravar na nuvem antes de mudar de ecrã ou finalizar.
-        </Text>
+    <ScrollView style={styles.scroll} contentContainerStyle={[styles.container, shell.screenPad]} keyboardShouldPersistTaps="handled">
+      <ModuleScreenHeader
+        kicker="Recebimento"
+        title="Conferência de materiais"
+        helpText="Ao abrir, carrega a nuvem e mostra as NFs pendentes de conferência. Toque numa linha para começar, ou filtre pelo campo abaixo. Guarde na nuvem antes de finalizar."
+        showHelp={mostrarTextosAjudaModulos}
+      />
+
+      <CloudSyncStrip configured={configured} error={loadErr} loading={loading && !payload} updatedAt={nuvemAt} />
+
+      {payload ? (
+        <StatPillRow
+          items={[
+            { label: 'Pendentes', value: recPendentesConferencia.length },
+            {
+              label: 'Recebimentos',
+              value: recsEscalaOk ? recsTotal : (payload.recebimentos?.length ?? 0),
+            },
+            { label: 'Materiais', value: payload.materiais?.length ?? 0 },
+          ]}
+        />
       ) : null}
 
-      <Pressable style={[styles.btn, loading && styles.btnDisabled]} onPress={carregarNuvem} disabled={loading || saving}>
-        {loading ? <ActivityIndicator color={colors.text} /> : <Text style={styles.btnTextPrimary}>Carregar dados da nuvem</Text>}
-      </Pressable>
-      {nuvemAt ? (
-        <Text style={styles.meta}>Última atualização (snapshot): {formatarDataHoraLocal(nuvemAt)} (hora do telemóvel)</Text>
-      ) : null}
-      {payload ? (
-        <Text style={styles.meta}>
-          {payload.recebimentos?.length ?? 0} recebimento(s) · {payload.materiais?.length ?? 0} material(is) ·{' '}
-          {payload.colaboradores?.length ?? 0} colaborador(es)
-        </Text>
-      ) : null}
-      {payload && (payload.recebimentos?.length ?? 0) === 0 ? (
+      <PrimaryActionButton
+        disabled={loading || saving}
+        label="Atualizar dados da nuvem"
+        loading={loading}
+        onPress={() => void carregarNuvem()}
+      />
+
+      {payload && !recsEscalaOk && (payload.recebimentos?.length ?? 0) === 0 ? (
         <Text style={styles.warn}>
           Este snapshot não traz recebimentos. No desktop, confirme que os recebimentos estão gravados na nuvem e o mesmo Supabase no `.env`.
         </Text>
       ) : null}
-      {loadErr ? <Text style={styles.err}>{loadErr}</Text> : null}
+      {payload && recsEscalaOk && recsTotal === 0 ? (
+        <Text style={styles.warn}>
+          Não há recebimentos «aguardando conferência» nas tabelas de escala. No PC, sincronize recebimentos (Configurações → Obra) se a lista estiver vazia.
+        </Text>
+      ) : null}
 
-      <Text style={styles.label}>NF, romaneio, fornecedor ou código do material</Text>
+      {mostrarListaPendentes ? (
+        <View style={{ marginBottom: 16 }}>
+          <Text style={[styles.label, { marginTop: 0 }]}>
+            Aguardando conferência ({recPendentesConferencia.length})
+          </Text>
+          {mostrarTextosAjudaModulos ? (
+            <Text style={[styles.hint, { marginBottom: 10 }]}>
+              Toque numa NF para abrir a contagem. «Em correção» = já começou no telemóvel ou PC e ainda não foi finalizada.
+            </Text>
+          ) : null}
+          {recPendentesConferencia.length === 0 ? (
+            <EmptyStatePanel
+              icon="check-decagram-outline"
+              message="Não há recebimentos «aguardando conferência» por conferir."
+              title="Nenhuma NF pendente"
+            />
+          ) : (
+            <FlatList
+              data={recPendentesConferencia}
+              initialNumToRender={12}
+              keyExtractor={(r) => `rec-pendente-${String(r.id)}`}
+              keyboardShouldPersistTaps="handled"
+              maxToRenderPerBatch={16}
+              nestedScrollEnabled
+              removeClippedSubviews
+              renderItem={({ item: r }) => (
+                <Pressable
+                  accessibilityRole="button"
+                  onPress={() => abrirRecebimentoDaLista(r)}
+                  style={styles.docLinha}
+                >
+                  <Text style={styles.docLinhaTit}>{rotuloNotaRomaneioRecebimento(r)}</Text>
+                  <Text numberOfLines={2} style={styles.docLinhaSub}>
+                    {r.fornecedorNome ?? '—'}
+                  </Text>
+                  <Text style={styles.docLinhaMeta}>
+                    {linhaEstadoConferenciaMobile(r)}
+                    {String(r.data ?? '').trim() ? ` · ${String(r.data ?? '').slice(0, 10)}` : ''}
+                    {r.itens?.length ? ` · ${r.itens.length} item(ns)` : ''}
+                  </Text>
+                </Pressable>
+              )}
+              style={{ maxHeight: 360 }}
+              windowSize={5}
+            />
+          )}
+        </View>
+      ) : null}
+
+      <Text style={styles.label}>Filtrar NF, romaneio, fornecedor ou código</Text>
       {mostrarTextosAjudaModulos ? (
         <Text style={[styles.hint, { marginBottom: 8 }]}>
-          A lista filtra enquanto digita (inclui códigos nas linhas da NF). Com ≥2 caracteres, após uma pausa tenta abrir sozinho se houver um
-          único resultado claro. Toque numa linha ou use «Buscar recebimento».
+          Opcional: filtre a lista enquanto digita. Com ≥2 caracteres, após uma pausa tenta abrir sozinho se houver um único resultado claro.
         </Text>
       ) : null}
       <TextInput
@@ -733,7 +1088,9 @@ export default function ConferenciaScreen() {
         autoCorrect={false}
       />
 
-      {payload && (payload.recebimentos?.length ?? 0) > 0 && nfBusca.trim().length > 0 ? (
+      {payload &&
+      (recsEscalaOk ? recsCloud.length > 0 || nfBusca.trim().length > 0 : (payload.recebimentos?.length ?? 0) > 0) &&
+      nfBusca.trim().length > 0 ? (
         <View style={{ marginBottom: 12 }}>
           <Text style={[styles.hint, { fontWeight: '700', marginBottom: 8, fontSize: 13 }]}>{tituloListaBusca}</Text>
           {listaBuscaUnificada.length === 0 ? (
@@ -758,10 +1115,7 @@ export default function ConferenciaScreen() {
                     style={[styles.docLinha, sel && styles.docLinhaSelected]}
                     accessibilityRole="button"
                     accessibilityState={{ selected: !!sel }}
-                    onPress={() => {
-                      setNfBusca(String(r.nota ?? r.romaneio ?? ''));
-                      abrirRecebimentoSeConferivel(r);
-                    }}
+                    onPress={() => abrirRecebimentoDaLista(r)}
                   >
                     <Text style={[styles.docLinhaTit, sel && styles.docLinhaTitSelected]}>
                       {rotuloNotaRomaneioRecebimento(r)}

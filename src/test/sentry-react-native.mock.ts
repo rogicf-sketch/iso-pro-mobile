@@ -4,6 +4,8 @@ export function init(options?: unknown): void {
 
 export function captureException(): void {}
 
+export function captureMessage(): void {}
+
 export function wrap<T>(c: T): T {
   return c;
 }
