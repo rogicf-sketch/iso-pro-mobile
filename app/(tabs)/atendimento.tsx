@@ -55,6 +55,7 @@ import {
   quantidadeAtendidaLinha,
   listarDocumentosComDemandaPendenteMaterial,
   materialTemDemandaPendenteNoDocumento,
+  mensagemBloqueioBaixaPorCodigo,
   montarHtmlReciboSessaoUnificada,
   montarTextoReciboSessaoUnificada,
   type LinhaSessaoAtendimento,
@@ -157,6 +158,8 @@ export default function AtendimentoScreen() {
   const [codigoBarras, setCodigoBarras] = useState('');
   const [qtdBarras, setQtdBarras] = useState('1');
   const [scannerOpen, setScannerOpen] = useState(false);
+  /** Evita repetir o alerta «não pode dar baixa» para o mesmo código nesta sessão de ecrã. */
+  const alertaBloqueioCodigoRef = useRef<string | null>(null);
   const [syncingComandos, setSyncingComandos] = useState(false);
   const [finalizandoSessao, setFinalizandoSessao] = useState(false);
   const [comandosPendentes, setComandosPendentes] = useState(0);
@@ -894,17 +897,12 @@ export default function AtendimentoScreen() {
     const avaliacao = avaliarLeituraScanAtendimento(payloadRef.current ?? payload, t);
     if (avaliacao.vazio) return;
     void playScanBeep();
-    // Sempre aceita a leitura e fecha o scanner. O cadastro local pode estar incompleto
-    // (fatia leve); a lista de desenhos pendentes resolve depois via RPC na nuvem.
+    // Aceita sempre a leitura. O cadastro local pode estar incompleto (fatia leve);
+    // a lista de desenhos pendentes resolve depois via RPC. Sem popup aqui —
+    // «código fora do cadastro local» confundia com «sem saldo».
     setCodigoBarras(avaliacao.codigo);
     setScannerOpen(false);
-    if (!avaliacao.encontrado) {
-      // Aviso suave — não bloqueia (antes rejeitava códigos reais da obra que não estavam no snapshot).
-      appAlert(
-        'Código aceite',
-        `«${avaliacao.codigo}» não está no cadastro local deste aparelho. A app vai procurar desenhos com este código na nuvem. Se não aparecer nenhum, envie o planejamento/materiais do PC.`,
-      );
-    }
+    alertaBloqueioCodigoRef.current = null;
   }, [payload]);
 
   const finalizarSessaoAtendimentoEPartilhar = useCallback(
@@ -1369,6 +1367,7 @@ export default function AtendimentoScreen() {
     if (!cur) {
       prevCodigoAlvoPlanejamentoRef.current = null;
       setMostrarListaDocsMaterial(false);
+      alertaBloqueioCodigoRef.current = null;
       return;
     }
     const prev = prevCodigoAlvoPlanejamentoRef.current;
@@ -1378,8 +1377,31 @@ export default function AtendimentoScreen() {
       setMsgBusca(null);
       setCandidatosBuscaDoc(null);
       prevCodigoAlvoPlanejamentoRef.current = cur;
+      alertaBloqueioCodigoRef.current = null;
     }
   }, [codigoAlvoPlanejamento]);
+
+  /** Depois da nuvem resolver a pendência: alerta claro se não der para atender (saldo/pendência). */
+  useEffect(() => {
+    const cur = codigoAlvoPlanejamento?.trim() ?? '';
+    if (!cur || carregandoDesenhos) return;
+    if (pendenciaMaterialCache?.codigo !== cur) return;
+    if (alertaBloqueioCodigoRef.current === cur) return;
+    const msg = mensagemBloqueioBaixaPorCodigo({
+      codigo: cur,
+      saldoEstoque: saldoEstoqueMaterialBarras,
+      temPendenciaPlanejamento: docsComPendenteMaterial.length > 0,
+    });
+    if (!msg) return;
+    alertaBloqueioCodigoRef.current = cur;
+    appAlert(msg.titulo, msg.corpo);
+  }, [
+    codigoAlvoPlanejamento,
+    carregandoDesenhos,
+    pendenciaMaterialCache,
+    saldoEstoqueMaterialBarras,
+    docsComPendenteMaterial.length,
+  ]);
 
   useDebouncedEffect(
     () => {
@@ -1637,15 +1659,26 @@ export default function AtendimentoScreen() {
         </Text>
       ) : null}
       {codigoBarras.trim() && saldoEstoqueMaterialBarras !== null && saldoEstoqueMaterialBarras <= 0 ? (
-        <Text style={styles.err}>Sem saldo — não pode dar baixa por código.</Text>
+        <Text style={styles.err}>Sem saldo em estoque — não pode efetuar atendimento neste código.</Text>
       ) : null}
-      {codigoAlvoPlanejamento && temPendenciaPlanejadaBarras === false ? (
-        <Text style={styles.warn}>Nenhuma quantidade por atender no planejamento para este código (ou já foi toda retirada).</Text>
+      {codigoAlvoPlanejamento &&
+      !carregandoDesenhos &&
+      pendenciaMaterialCache?.codigo === codigoAlvoPlanejamento.trim() &&
+      temPendenciaPlanejadaBarras === false ? (
+        <Text style={styles.err}>
+          Sem quantidade pendente no planejamento — já foi toda retirada ou não há desenho com falta. Não pode efetuar
+          atendimento neste item.
+        </Text>
       ) : null}
-      {codigoBarras.trim() && !materialDoScan ? (
+      {codigoBarras.trim() &&
+      !materialDoScan &&
+      !carregandoDesenhos &&
+      !temPendenciaPlanejadaBarras &&
+      !doc &&
+      pendenciaMaterialCache?.codigo === (codigoAlvoPlanejamento?.trim() ?? '') ? (
         <Text style={[styles.warn, { fontSize: 12 }]}>
-          Código não encontrado nem no cadastro de materiais do snapshot nem nas linhas dos desenhos — confira o código, envie o planejamento do PC
-          para a nuvem e toque em «Carregar dados da nuvem».
+          Código ainda não reconhecido no cadastro local. Se a nuvem também não trouxe desenhos, envie o planejamento do
+          PC e toque em «Carregar dados da nuvem».
         </Text>
       ) : null}
       <View style={styles.rowBarras}>

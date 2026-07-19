@@ -7,6 +7,7 @@ import {
   garantirIdsDocumentosPlanejamento,
   gerarCodigoBarras,
   listarDocumentosComDemandaPendenteMaterial,
+  mensagemBloqueioBaixaPorCodigo,
   resolverMaterialParaBaixaPorCodigo,
 } from './registrarAtendimento';
 
@@ -150,5 +151,49 @@ describe('resolverMaterialParaBaixaPorCodigo', () => {
       ],
     };
     expect(resolverMaterialParaBaixaPorCodigo(payload, 'Y2')?.descricao).toBe('Linha Y');
+  });
+});
+
+describe('mensagemBloqueioBaixaPorCodigo', () => {
+  it('null quando ha saldo e pendencia', () => {
+    expect(
+      mensagemBloqueioBaixaPorCodigo({
+        codigo: 'TB-01',
+        saldoEstoque: 10,
+        temPendenciaPlanejamento: true,
+      }),
+    ).toBeNull();
+  });
+
+  it('explica sem saldo', () => {
+    const m = mensagemBloqueioBaixaPorCodigo({
+      codigo: 'TB-01',
+      saldoEstoque: 0,
+      temPendenciaPlanejamento: true,
+    });
+    expect(m?.titulo).toBe('Sem saldo');
+    expect(m?.corpo).toMatch(/sem saldo em estoque/i);
+    expect(m?.corpo).toMatch(/Não é possível efetuar atendimento/i);
+  });
+
+  it('explica sem pendencia no planejamento', () => {
+    const m = mensagemBloqueioBaixaPorCodigo({
+      codigo: 'TB-01',
+      saldoEstoque: 5,
+      temPendenciaPlanejamento: false,
+    });
+    expect(m?.titulo).toBe('Sem pendência no planejamento');
+    expect(m?.corpo).toMatch(/não tem quantidade por atender/i);
+  });
+
+  it('combina sem saldo e sem pendencia', () => {
+    const m = mensagemBloqueioBaixaPorCodigo({
+      codigo: 'X',
+      saldoEstoque: 0,
+      temPendenciaPlanejamento: false,
+    });
+    expect(m?.titulo).toBe('Não pode dar baixa');
+    expect(m?.corpo).toMatch(/sem saldo/i);
+    expect(m?.corpo).toMatch(/sem quantidade pendente/i);
   });
 });

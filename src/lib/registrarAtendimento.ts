@@ -301,6 +301,38 @@ export function avaliarLeituraScanAtendimento(
   };
 }
 
+/**
+ * Mensagem clara para o operador quando a baixa por scan fica bloqueada
+ * (sem saldo e/ou sem pendência no planejamento). null = pode tentar atender.
+ */
+export function mensagemBloqueioBaixaPorCodigo(input: {
+  codigo: string;
+  saldoEstoque: number | null;
+  temPendenciaPlanejamento: boolean;
+}): { titulo: string; corpo: string } | null {
+  const cod = String(input.codigo ?? '').trim();
+  if (!cod) return null;
+  const semSaldo = input.saldoEstoque !== null && input.saldoEstoque <= 0;
+  const semPendencia = !input.temPendenciaPlanejamento;
+  if (!semSaldo && !semPendencia) return null;
+  if (semSaldo && semPendencia) {
+    return {
+      titulo: 'Não pode dar baixa',
+      corpo: `«${cod}» está sem saldo em estoque e sem quantidade pendente no planejamento. Não é possível efetuar atendimento deste item.`,
+    };
+  }
+  if (semSaldo) {
+    return {
+      titulo: 'Sem saldo',
+      corpo: `«${cod}» está sem saldo em estoque. Não é possível efetuar atendimento deste item.`,
+    };
+  }
+  return {
+    titulo: 'Sem pendência no planejamento',
+    corpo: `«${cod}» não tem quantidade por atender (já foi toda retirada ou não há desenho com falta). Não é possível efetuar atendimento deste item.`,
+  };
+}
+
 /** Documentos (desenhos) do planejamento com quantidade pendente para o `codigo` do material. */
 export function listarDocumentosComDemandaPendenteMaterial(
   payload: IsoSnapshotPayload,
