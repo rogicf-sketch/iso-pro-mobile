@@ -21,6 +21,9 @@ export type ReconciliacaoAtendimentoResult = {
   itensSessao: number;
   itensNuvem: number;
   tentativas: number;
+  /** Fatia autoritativa que confirmou a sessão; evita uma segunda leitura pesada ao finalizar. */
+  payloadHistorico?: IsoSnapshotPayload;
+  updatedAt?: string | null;
   error?: string;
 };
 
@@ -87,9 +90,9 @@ export async function reconciliarSessaoAtendimentoNaNuvem(input: {
   let lastError: string | undefined;
 
   for (let round = 0; round < RECONCILE_MAX_ROUNDS; round++) {
-    await waitForAtendimentoSyncIdle();
+    // `flushAtendimentoComandoQueue` já entra na mesma fila exclusiva das gravações
+    // optimistas; ao resolver, todas as gravações anteriores também terminaram.
     const flush = await flushAtendimentoComandoQueue();
-    await waitForAtendimentoSyncIdle();
 
     const pending = await getAtendimentoComandoQueueSize();
     if (pending > 0 || flush.remaining > 0) {
@@ -124,6 +127,8 @@ export async function reconciliarSessaoAtendimentoNaNuvem(input: {
         itensSessao,
         itensNuvem: lastItensNuvem,
         tentativas: round + 1,
+        payloadHistorico: cloudPayload,
+        updatedAt,
       };
     }
 

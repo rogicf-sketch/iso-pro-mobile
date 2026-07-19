@@ -4,7 +4,6 @@ import {
   flushAtendimentoComandoQueue,
   getAtendimentoComandoQueueSize,
   setAtendimentoCloudBaselineCursor,
-  waitForAtendimentoSyncIdle,
 } from './atendimentoComando';
 export {
   contarHistoricoLote,
@@ -40,7 +39,13 @@ export type GarantirAtendimentoSyncInput = {
   linhasSessao?: LinhaSessaoAtendimento[];
 };
 
-/** Espera sync, reconcilia itens em falta e recarrega histórico da nuvem antes do recibo. */
+/**
+ * Espera o sync e confirma o histórico antes do recibo.
+ *
+ * Caminho normal: uma leitura leve (histórico + lotes). Só baixa `documentos` e
+ * executa a reconciliação pesada quando a nuvem realmente ainda não tem todos
+ * os itens. Isso evita transferir ~7 MB várias vezes ao finalizar pelo scan.
+ */
 export async function garantirAtendimentoSincronizadoNaNuvem(
   input: GarantirAtendimentoSyncInput | IsoSnapshotPayload | null,
 ): Promise<GarantiaSyncAtendimentoResult> {
@@ -54,9 +59,9 @@ export async function garantirAtendimentoSincronizadoNaNuvem(
     return { ok: false, error: 'Carregue os dados da nuvem primeiro.', pendingQueue: 0 };
   }
 
-  await waitForAtendimentoSyncIdle();
+  // O flush usa a mesma fila exclusiva das gravações optimistas; esperar o flush
+  // já espera também os syncs em background iniciados antes da finalização.
   const flush = await flushAtendimentoComandoQueue();
-  await waitForAtendimentoSyncIdle();
 
   let pending = await getAtendimentoComandoQueueSize();
   if (pending > 0 || flush.remaining > 0) {
@@ -74,11 +79,46 @@ export async function garantirAtendimentoSincronizadoNaNuvem(
     };
   }
 
-  if (opts.loteRef?.loteNumero && opts.linhasSessao?.length) {
+  const loteValido = Boolean(opts.loteRef?.loteNumero && opts.linhasSessao?.length);
+  const itensSessao = loteValido
+    ? contarItensOperacaoRecibo(
+        opts.linhasSessao!.filter(
+          (l) => String(l.loteNumero ?? '').trim() === String(opts.loteRef!.loteNumero).trim(),
+        ),
+      )
+    : 0;
+
+  // Confirma primeiro com a menor fatia possível. Histórico e lotes bastam
+  // para provar que todas as baixas chegaram e para montar o recibo.
+  const leituraLeve = await fetchSnapshotSlices(
+    ['atendimentoHistorico', 'atendimentoLotes'],
+    { bypassCache: true },
+  );
+  if (leituraLeve.error) {
+    return {
+      ok: false,
+      error: `Não foi possível confirmar na nuvem: ${leituraLeve.error}`,
+      pendingQueue: 0,
+    };
+  }
+
+  const cloudLeve = {
+    ...payloadLocal,
+    ...(leituraLeve.payload ?? {}),
+  };
+  // A contagem deve usar a fatia autoritativa da nuvem antes de preservar os
+  // registos optimistas locais; caso contrário um item ainda não enviado
+  // poderia ser contado como já confirmado.
+  let itensNuvem = opts.loteRef ? contarHistoricoLote(cloudLeve, opts.loteRef) : 0;
+  let merged = mergeAtendimentoPayloadPreservandoLocal(cloudLeve, payloadLocal);
+  let updatedAt = leituraLeve.updatedAt ?? flush.lastUpdatedAt;
+
+  // Fallback de reparação: apenas quando a leitura leve prova que falta algo.
+  if (loteValido && itensNuvem < itensSessao) {
     const reconcile = await reconciliarSessaoAtendimentoNaNuvem({
       payloadLocal,
-      loteRef: opts.loteRef,
-      linhasSessao: opts.linhasSessao,
+      loteRef: opts.loteRef!,
+      linhasSessao: opts.linhasSessao!,
     });
     if (!reconcile.ok) {
       return {
@@ -89,27 +129,12 @@ export async function garantirAtendimentoSincronizadoNaNuvem(
         itensNuvem: reconcile.itensNuvem,
       };
     }
+    if (reconcile.payloadHistorico) {
+      merged = mergeAtendimentoPayloadPreservandoLocal(reconcile.payloadHistorico, payloadLocal);
+    }
+    updatedAt = reconcile.updatedAt ?? updatedAt;
+    itensNuvem = reconcile.itensNuvem;
   }
-
-  const { payload: slice, updatedAt, error } = await fetchSnapshotSlices(
-    ['atendimentoHistorico', 'atendimentoLotes', 'documentos'],
-    { bypassCache: true },
-  );
-  if (error) {
-    return {
-      ok: false,
-      error: `Não foi possível confirmar na nuvem: ${error}`,
-      pendingQueue: 0,
-    };
-  }
-
-  const merged = mergeAtendimentoPayloadPreservandoLocal(
-    {
-      ...payloadLocal,
-      ...(slice ?? {}),
-    },
-    payloadLocal,
-  );
 
   if (updatedAt) {
     setAtendimentoCloudBaselineCursor(updatedAt);
@@ -117,19 +142,9 @@ export async function garantirAtendimentoSincronizadoNaNuvem(
 
   pending = await getAtendimentoComandoQueueSize();
 
-  const itensSessao =
-    opts.loteRef && opts.linhasSessao?.length
-      ? contarItensOperacaoRecibo(
-          opts.linhasSessao.filter(
-            (l) => String(l.loteNumero ?? '').trim() === String(opts.loteRef!.loteNumero).trim(),
-          ),
-        )
-      : 0;
-  const itensNuvem = opts.loteRef ? contarHistoricoLote(merged, opts.loteRef) : 0;
-
   return {
     ok: true,
-    updatedAt: updatedAt ?? flush.lastUpdatedAt,
+    updatedAt,
     payloadHistorico: merged,
     itensSessao,
     itensNuvem,
