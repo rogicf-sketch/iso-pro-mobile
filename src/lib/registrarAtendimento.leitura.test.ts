@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { IsoSnapshotPayload, Material } from 'iso-pro-shared';
 import {
+  avaliarLeituraScanAtendimento,
   encontrarMaterialPorCodigoOuBarras,
   extrairCodigoMaterialDeTextoLeitura,
   garantirIdsDocumentosPlanejamento,
@@ -21,6 +22,44 @@ describe('extrairCodigoMaterialDeTextoLeitura', () => {
   it('extrai de JSON e devolve texto simples', () => {
     expect(extrairCodigoMaterialDeTextoLeitura('{"codigo":"MEC-1"}')).toBe('MEC-1');
     expect(extrairCodigoMaterialDeTextoLeitura('  ABC  ')).toBe('ABC');
+  });
+});
+
+describe('avaliarLeituraScanAtendimento', () => {
+  const payload = {
+    materiais: [{ codigo: 'TB-01', descricao: 'Tubo', unidade: 'UN' }],
+    documentos: [],
+  } as unknown as IsoSnapshotPayload;
+
+  it('marca encontrado quando o codigo existe no cadastro', () => {
+    const r = avaliarLeituraScanAtendimento(payload, 'TB-01');
+    expect(r.encontrado).toBe(true);
+    expect(r.codigo).toBe('TB-01');
+    expect(r.vazio).toBe(false);
+  });
+
+  it('resolve pelo hash 1D e devolve o codigo canonico', () => {
+    const hash = gerarCodigoBarras('TB-01');
+    const r = avaliarLeituraScanAtendimento(payload, hash);
+    expect(r.encontrado).toBe(true);
+    expect(r.codigo).toBe('TB-01');
+  });
+
+  it('marca nao encontrado quando o codigo nao existe', () => {
+    const r = avaliarLeituraScanAtendimento(payload, 'NAO-EXISTE-999');
+    expect(r.encontrado).toBe(false);
+    expect(r.vazio).toBe(false);
+    expect(r.codigo).toBe('NAO-EXISTE-999');
+  });
+
+  it('marca vazio quando a leitura nao produz codigo', () => {
+    expect(avaliarLeituraScanAtendimento(payload, '   ').vazio).toBe(true);
+  });
+
+  it('sem payload devolve nao encontrado mas com o codigo extraido', () => {
+    const r = avaliarLeituraScanAtendimento(null, 'NF:1|COD:TB-01|ROM:R1');
+    expect(r.encontrado).toBe(false);
+    expect(r.codigo).toBe('TB-01');
   });
 });
 

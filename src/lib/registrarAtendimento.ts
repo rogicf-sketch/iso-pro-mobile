@@ -258,6 +258,42 @@ export function resolverMaterialParaBaixaPorCodigo(
   );
 }
 
+export interface AvaliacaoLeituraScan {
+  /** Texto cru lido pela câmara/leitor. */
+  textoLido: string;
+  /** Código canónico resolvido (cadastro/linha) ou o código extraído do texto. */
+  codigo: string;
+  /** true quando a leitura casa com um material do cadastro ou linha de desenho. */
+  encontrado: boolean;
+  /** true quando o texto lido não produz sequer um código utilizável. */
+  vazio: boolean;
+}
+
+/**
+ * Avalia uma leitura de scan ANTES de a colocar no formulário, para dar feedback
+ * imediato (bip/erro) quando o código não existe. Não altera estado — pura e testável.
+ */
+export function avaliarLeituraScanAtendimento(
+  payload: IsoSnapshotPayload | null | undefined,
+  textoLido: string,
+): AvaliacaoLeituraScan {
+  const bruto = String(textoLido ?? '').trim();
+  const codigoExtraido = extrairCodigoMaterialDeTextoLeitura(bruto) || bruto;
+  if (!bruto || !codigoExtraido) {
+    return { textoLido: bruto, codigo: '', encontrado: false, vazio: true };
+  }
+  if (!payload) {
+    return { textoLido: bruto, codigo: codigoExtraido, encontrado: false, vazio: false };
+  }
+  const material = resolverMaterialParaBaixaPorCodigo(payload, bruto);
+  return {
+    textoLido: bruto,
+    codigo: material?.codigo ? String(material.codigo) : codigoExtraido,
+    encontrado: Boolean(material?.codigo),
+    vazio: false,
+  };
+}
+
 /** Documentos (desenhos) do planejamento com quantidade pendente para o `codigo` do material. */
 export function listarDocumentosComDemandaPendenteMaterial(
   payload: IsoSnapshotPayload,

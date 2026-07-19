@@ -73,6 +73,7 @@ import {
   limparRascunhoConferencia,
   salvarRascunhoConferencia,
 } from '@/src/lib/conferenciaRascunhoStorage';
+import { mergeRecebimentoConferido } from '@/src/lib/conferenciaMerge';
 import { registerConferenciaSessaoGate } from '@/src/lib/conferenciaSessaoGate';
 import { useSnapshotRefreshOnAppActive } from '@/src/lib/useSnapshotRefreshOnAppActive';
 import { useDebouncedEffect } from '@/src/lib/useDebouncedEffect';
@@ -97,31 +98,13 @@ function mesmoRecebimentoConferencia(selecionado: Recebimento | null, linha: Rec
   return String(selecionado.id) === String(linha.id);
 }
 
-/** Alinha o rascunho local com linhas atualizadas do servidor (snapshot ou detalhe RPC). */
+/**
+ * Alinha o rascunho local com linhas atualizadas do servidor (snapshot ou detalhe RPC).
+ * Casa por código (não por posição) para não colar a quantidade conferida no item errado
+ * quando o servidor reordena/insere/remove linhas. Implementação testada em `conferenciaMerge.ts`.
+ */
 function mergeRecComPayload(draftRec: Recebimento, p: IsoSnapshotPayload): Recebimento {
-  const server = p.recebimentos?.find((r) => String(r.id) === String(draftRec.id));
-  if (!server) return deepClone(draftRec);
-  const merged = deepClone(server);
-  const draftItens = draftRec.itens || [];
-  (merged.itens || []).forEach((it, i) => {
-    const d = draftItens[i];
-    if (d && it) {
-      it.quantidadeConferida = d.quantidadeConferida;
-      const obs = d.observacaoItem;
-      if (obs !== undefined && obs !== null && String(obs).trim() !== '') {
-        it.observacaoItem = String(obs).trim();
-      } else {
-        delete it.observacaoItem;
-      }
-      const loc = locLinhaNormalizada(d);
-      if (loc) {
-        it.localizacao = loc;
-      } else {
-        delete it.localizacao;
-      }
-    }
-  });
-  return merged;
+  return mergeRecebimentoConferido(draftRec, p);
 }
 
 function upsertRecebimentoNoPayload(p: IsoSnapshotPayload, full: Recebimento): IsoSnapshotPayload {

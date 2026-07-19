@@ -49,6 +49,7 @@ import {
   encontrarMaterialPorCodigoOuBarras,
   extrairCodigoMaterialDeTextoLeitura,
   resolverMaterialParaBaixaPorCodigo,
+  avaliarLeituraScanAtendimento,
   codigoNaLinhaPlanejamento,
   descricaoNaLinhaPlanejamento,
   quantidadeAtendidaLinha,
@@ -890,11 +891,21 @@ export default function AtendimentoScreen() {
     scanCooldownRef.current = now;
     const t = (data || '').trim();
     if (!t) return;
-    const limpo = extrairCodigoMaterialDeTextoLeitura(t) || t;
+    const avaliacao = avaliarLeituraScanAtendimento(payloadRef.current ?? payload, t);
+    if (avaliacao.vazio) return;
+    // Leitura que não casa com nenhum material: não fecha o scanner, avisa e deixa reler.
+    if (!avaliacao.encontrado) {
+      void playScanBeep();
+      appAlert(
+        'Código não reconhecido',
+        `A leitura «${avaliacao.codigo}» não corresponde a nenhum material do cadastro nem a linha de desenho. Confira o código ou envie o planejamento do PC. Pode ler de novo.`,
+      );
+      return;
+    }
     void playScanBeep();
-    setCodigoBarras(limpo);
+    setCodigoBarras(avaliacao.codigo);
     setScannerOpen(false);
-  }, []);
+  }, [payload]);
 
   const finalizarSessaoAtendimentoEPartilhar = useCallback(
     (opts?: { skipConfirm?: boolean }) => {
