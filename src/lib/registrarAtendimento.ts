@@ -187,6 +187,13 @@ export function encontrarMaterialPorCodigoOuBarras(materiais: Material[], valor:
   const up = termo.toUpperCase();
   const porCodigo = materiais.find((m) => String(m.codigo || '').toUpperCase() === up);
   if (porCodigo) return porCodigo;
+  const porBarrasCadastro = materiais.find((m) => {
+    const b = String((m as { codigoBarras?: string }).codigoBarras ?? '')
+      .trim()
+      .toUpperCase();
+    return b !== '' && b === up;
+  });
+  if (porBarrasCadastro) return porBarrasCadastro;
   return materiais.find((m) => gerarCodigoBarras(String(m.codigo || '')) === termo) ?? null;
 }
 

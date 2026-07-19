@@ -193,10 +193,17 @@ export default function ConferenciaScreen() {
     return `Resultados ao digitar (${listaBuscaUnificada.length}${listaBuscaUnificada.length >= 50 ? '+' : ''}) — toque para abrir`;
   }, [candidatosRec, rec, listaBuscaUnificada.length, recsEscalaOk, nfBusca, recsTotal]);
 
-  const recPendentesConferencia = useMemo(
-    () => listarRecebimentosPendentesConferencia(listaRecebimentosAtiva),
-    [listaRecebimentosAtiva],
-  );
+  const recPendentesConferencia = useMemo(() => {
+    const base = listarRecebimentosPendentesConferencia(listaRecebimentosAtiva);
+    // Snapshot pode já estar conferido enquanto as tabelas de escala ainda não sincronizaram.
+    const conferidosNoSnapshot = new Set(
+      (payload?.recebimentos ?? [])
+        .filter((r) => String(r.statusConferencia || '').toLowerCase() === 'conferido')
+        .map((r) => String(r.id)),
+    );
+    if (conferidosNoSnapshot.size === 0) return base;
+    return base.filter((r) => !conferidosNoSnapshot.has(String(r.id)));
+  }, [listaRecebimentosAtiva, payload?.recebimentos]);
 
   const mostrarListaPendentes = Boolean(payload && !rec && nfBusca.trim().length === 0);
 
@@ -717,7 +724,11 @@ export default function ConferenciaScreen() {
       const r = deepClone(rec);
       normalizarLocalizacaoItensRecebimento(r.itens);
       r.statusConferencia = 'conferido';
-      /** Mantém o modo de negócio «aguardando conferência»; o estado final fica em `statusConferencia`. */
+      // Campo `status` nas tabelas de escala (SoT da lista). Sem isto o sync
+      // iso_pro_sync_recebimentos_from_snapshot mantém «aguardando_conferencia»
+      // e a NF continua na lista de pendentes após «Atualizar dados da nuvem».
+      (r as Recebimento & { status?: string }).status = 'conferido';
+      /** Mantém o modo de negócio «aguardando conferência»; o estado final fica em `status`/`statusConferencia`. */
       r.modoRecebimento = 'aguardando_conferencia';
       r.dataConferencia = new Date().toISOString();
       (r.itens || []).forEach((it) => {
@@ -773,6 +784,16 @@ export default function ConferenciaScreen() {
           setPayload(nextPayload);
         }
         setRec(r);
+        // Lista pendente vem das tabelas de escala — atualiza UI já e sincroniza snapshot→tabelas.
+        setRecsCloud((prev) => prev.filter((x) => String(x.id) !== String(r.id)));
+        setRecsTotal((t) => Math.max(0, t - 1));
+        if (!result.queued) {
+          void syncRecebimentosFromSnapshotCloud().then((sync) => {
+            if (sync.ok) {
+              void carregarPaginaRecebimentos(nfBusca);
+            }
+          });
+        }
         if (result.updatedAt) {
           setNuvemAt(result.updatedAt);
         }
@@ -818,7 +839,7 @@ export default function ConferenciaScreen() {
     } else {
       abrirConfirmacaoStock();
     }
-  }, [carregarNuvem, mergeRecNoPayload, nuvemAt, payload, rec]);
+  }, [carregarNuvem, carregarPaginaRecebimentos, mergeRecNoPayload, nfBusca, nuvemAt, payload, rec]);
 
   const podeEditarConferenciaRec = useMemo(() => recebimentoPermiteEditarConferencia(rec), [rec]);
 

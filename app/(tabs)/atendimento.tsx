@@ -893,18 +893,18 @@ export default function AtendimentoScreen() {
     if (!t) return;
     const avaliacao = avaliarLeituraScanAtendimento(payloadRef.current ?? payload, t);
     if (avaliacao.vazio) return;
-    // Leitura que não casa com nenhum material: não fecha o scanner, avisa e deixa reler.
-    if (!avaliacao.encontrado) {
-      void playScanBeep();
-      appAlert(
-        'Código não reconhecido',
-        `A leitura «${avaliacao.codigo}» não corresponde a nenhum material do cadastro nem a linha de desenho. Confira o código ou envie o planejamento do PC. Pode ler de novo.`,
-      );
-      return;
-    }
     void playScanBeep();
+    // Sempre aceita a leitura e fecha o scanner. O cadastro local pode estar incompleto
+    // (fatia leve); a lista de desenhos pendentes resolve depois via RPC na nuvem.
     setCodigoBarras(avaliacao.codigo);
     setScannerOpen(false);
+    if (!avaliacao.encontrado) {
+      // Aviso suave — não bloqueia (antes rejeitava códigos reais da obra que não estavam no snapshot).
+      appAlert(
+        'Código aceite',
+        `«${avaliacao.codigo}» não está no cadastro local deste aparelho. A app vai procurar desenhos com este código na nuvem. Se não aparecer nenhum, envie o planejamento/materiais do PC.`,
+      );
+    }
   }, [payload]);
 
   const finalizarSessaoAtendimentoEPartilhar = useCallback(
