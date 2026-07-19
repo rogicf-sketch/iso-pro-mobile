@@ -4,7 +4,13 @@ import {
   flushAtendimentoComandoQueue,
   getAtendimentoComandoQueueSize,
   setAtendimentoCloudBaselineCursor,
+  waitForAtendimentoSyncIdle,
 } from './atendimentoComando';
+import { fetchSnapshotSlices } from './snapshot';
+import type { LinhaSessaoAtendimento } from './registrarAtendimento';
+import { mergeAtendimentoPayloadPreservandoLocal } from './mergeAtendimentoPayloadLocal';
+import { contarHistoricoLote, contarItensOperacaoRecibo } from './atendimentoReciboValidacao';
+
 export {
   contarHistoricoLote,
   contarItensOperacaoRecibo,
@@ -17,11 +23,32 @@ export {
   type ReconciliacaoAtendimentoResult,
   type ResumoConfirmacaoSessaoNuvem,
 } from './atendimentoReconciliacao';
-import { fetchSnapshotSlices } from './snapshot';
-import type { LinhaSessaoAtendimento } from './registrarAtendimento';
-import { mergeAtendimentoPayloadPreservandoLocal } from './mergeAtendimentoPayloadLocal';
-import { reconciliarSessaoAtendimentoNaNuvem } from './atendimentoReconciliacao';
-import { contarHistoricoLote, contarItensOperacaoRecibo } from './atendimentoReciboValidacao';
+
+const SYNC_IDLE_TIMEOUT_MS = 15_000;
+const FLUSH_TIMEOUT_MS = 15_000;
+const LEITURA_CONFIRM_TIMEOUT_MS = 10_000;
+const CONFIRMACAO_LEVE_MAX_TENTATIVAS = 3;
+const CONFIRMACAO_LEVE_INTERVALO_MS = 800;
+
+type TimeoutResult<T> = { ok: true; value: T } | { ok: false };
+
+async function comTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<TimeoutResult<T>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then((value): TimeoutResult<T> => ({ ok: true, value })),
+      new Promise<TimeoutResult<T>>((resolve) => {
+        timer = setTimeout(() => resolve({ ok: false }), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function esperar(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export type GarantiaSyncAtendimentoResult =
   | {
@@ -42,9 +69,9 @@ export type GarantirAtendimentoSyncInput = {
 /**
  * Espera o sync e confirma o histórico antes do recibo.
  *
- * Caminho normal: uma leitura leve (histórico + lotes). Só baixa `documentos` e
- * executa a reconciliação pesada quando a nuvem realmente ainda não tem todos
- * os itens. Isso evita transferir ~7 MB várias vezes ao finalizar pelo scan.
+ * Caminho normal: aguarda a gravação já iniciada pelo scan e confirma com uma
+ * leitura leve (histórico + lotes). Nunca baixa `documentos[]` ao finalizar.
+ * Toda espera tem limite: rede lenta não pode prender o overlay por minutos.
  */
 export async function garantirAtendimentoSincronizadoNaNuvem(
   input: GarantirAtendimentoSyncInput | IsoSnapshotPayload | null,
@@ -59,24 +86,40 @@ export async function garantirAtendimentoSincronizadoNaNuvem(
     return { ok: false, error: 'Carregue os dados da nuvem primeiro.', pendingQueue: 0 };
   }
 
-  // O flush usa a mesma fila exclusiva das gravações optimistas; esperar o flush
-  // já espera também os syncs em background iniciados antes da finalização.
-  const flush = await flushAtendimentoComandoQueue();
-
-  let pending = await getAtendimentoComandoQueueSize();
-  if (pending > 0 || flush.remaining > 0) {
+  // O scan inicia a gravação em background. Aguarda esse envio antes de consultar
+  // o histórico, mas não deixa uma chamada HTTP presa bloquear a tela por minutos.
+  const idle = await comTimeout(waitForAtendimentoSyncIdle(), SYNC_IDLE_TIMEOUT_MS);
+  if (!idle.ok) {
     return {
       ok: false,
-      error: `${Math.max(pending, flush.remaining)} baixa(s) ainda não foram enviadas. Verifique a ligação e tente de novo.`,
-      pendingQueue: Math.max(pending, flush.remaining),
+      error:
+        'A baixa ainda está a ser enviada. A ligação está mais lenta que o normal; aguarde alguns segundos e toque em Finalizar novamente.',
+      pendingQueue: await getAtendimentoComandoQueueSize(),
     };
   }
-  if (flush.hadErrors) {
-    return {
-      ok: false,
-      error: 'Falha ao sincronizar baixas com a nuvem. Recarregue os dados e tente de novo.',
-      pendingQueue: 0,
-    };
+
+  let pending = await getAtendimentoComandoQueueSize();
+  let lastUpdatedAt: string | null = null;
+  if (pending > 0) {
+    const flushResult = await comTimeout(flushAtendimentoComandoQueue(), FLUSH_TIMEOUT_MS);
+    if (!flushResult.ok) {
+      return {
+        ok: false,
+        error:
+          'A fila de baixas continua a sincronizar. Aguarde alguns segundos e toque em Finalizar novamente; a sessão foi preservada.',
+        pendingQueue: pending,
+      };
+    }
+    const flush = flushResult.value;
+    pending = await getAtendimentoComandoQueueSize();
+    if (pending > 0 || flush.remaining > 0 || flush.hadErrors) {
+      return {
+        ok: false,
+        error: `${Math.max(pending, flush.remaining)} baixa(s) ainda não foram confirmadas. Verifique a ligação e tente novamente.`,
+        pendingQueue: Math.max(pending, flush.remaining),
+      };
+    }
+    lastUpdatedAt = flush.lastUpdatedAt;
   }
 
   const loteValido = Boolean(opts.loteRef?.loteNumero && opts.linhasSessao?.length);
@@ -88,59 +131,61 @@ export async function garantirAtendimentoSincronizadoNaNuvem(
       )
     : 0;
 
-  // Confirma primeiro com a menor fatia possível. Histórico e lotes bastam
-  // para provar que todas as baixas chegaram e para montar o recibo.
-  const leituraLeve = await fetchSnapshotSlices(
-    ['atendimentoHistorico', 'atendimentoLotes'],
-    { bypassCache: true },
-  );
-  if (leituraLeve.error) {
-    return {
-      ok: false,
-      error: `Não foi possível confirmar na nuvem: ${leituraLeve.error}`,
-      pendingQueue: 0,
-    };
+  // A projeção do histórico pode levar instantes para ficar visível. Faz somente
+  // leituras leves; o caminho antigo baixava ~7 MB de documentos até 8 vezes.
+  let itensNuvem = 0;
+  let merged: IsoSnapshotPayload | null = null;
+  let updatedAt = lastUpdatedAt;
+  let ultimoErro: string | null = null;
+  for (let tentativa = 0; tentativa < CONFIRMACAO_LEVE_MAX_TENTATIVAS; tentativa++) {
+    if (tentativa > 0) await esperar(CONFIRMACAO_LEVE_INTERVALO_MS);
+    const leituraResult = await comTimeout(
+      fetchSnapshotSlices(['atendimentoHistorico', 'atendimentoLotes'], { bypassCache: true }),
+      LEITURA_CONFIRM_TIMEOUT_MS,
+    );
+    if (!leituraResult.ok) {
+      ultimoErro = 'A leitura de confirmação excedeu 10 segundos.';
+      break;
+    }
+    const leitura = leituraResult.value;
+    if (leitura.error) {
+      ultimoErro = leitura.error;
+      break;
+    }
+    // Conta somente a resposta autoritativa. Não mistura o histórico otimista
+    // local antes da prova, pois isso exibia “confirmado” cedo demais.
+    const cloudAutoritativo = (leitura.payload ?? {}) as IsoSnapshotPayload;
+    itensNuvem = opts.loteRef ? contarHistoricoLote(cloudAutoritativo, opts.loteRef) : 0;
+    merged = mergeAtendimentoPayloadPreservandoLocal(
+      { ...payloadLocal, ...cloudAutoritativo },
+      payloadLocal,
+    );
+    updatedAt = leitura.updatedAt ?? updatedAt;
+    if (!loteValido || itensNuvem >= itensSessao) break;
   }
 
-  const cloudLeve = {
-    ...payloadLocal,
-    ...(leituraLeve.payload ?? {}),
-  };
-  // A contagem deve usar a fatia autoritativa da nuvem antes de preservar os
-  // registos optimistas locais; caso contrário um item ainda não enviado
-  // poderia ser contado como já confirmado.
-  let itensNuvem = opts.loteRef ? contarHistoricoLote(cloudLeve, opts.loteRef) : 0;
-  let merged = mergeAtendimentoPayloadPreservandoLocal(cloudLeve, payloadLocal);
-  let updatedAt = leituraLeve.updatedAt ?? flush.lastUpdatedAt;
-
-  // Fallback de reparação: apenas quando a leitura leve prova que falta algo.
+  if (ultimoErro) {
+    return {
+      ok: false,
+      error: `Não foi possível confirmar na nuvem: ${ultimoErro}`,
+      pendingQueue: 0,
+      itensSessao,
+      itensNuvem,
+    };
+  }
   if (loteValido && itensNuvem < itensSessao) {
-    const reconcile = await reconciliarSessaoAtendimentoNaNuvem({
-      payloadLocal,
-      loteRef: opts.loteRef!,
-      linhasSessao: opts.linhasSessao!,
-    });
-    if (!reconcile.ok) {
-      return {
-        ok: false,
-        error: reconcile.error ?? 'Reconciliação automática não concluiu.',
-        pendingQueue: 0,
-        itensSessao: reconcile.itensSessao,
-        itensNuvem: reconcile.itensNuvem,
-      };
-    }
-    if (reconcile.payloadHistorico) {
-      merged = mergeAtendimentoPayloadPreservandoLocal(reconcile.payloadHistorico, payloadLocal);
-    }
-    updatedAt = reconcile.updatedAt ?? updatedAt;
-    itensNuvem = reconcile.itensNuvem;
+    return {
+      ok: false,
+      error: `A nuvem confirmou ${itensNuvem} de ${itensSessao} item(ns). Aguarde alguns segundos e toque em Finalizar novamente.`,
+      pendingQueue: 0,
+      itensSessao,
+      itensNuvem,
+    };
   }
 
   if (updatedAt) {
     setAtendimentoCloudBaselineCursor(updatedAt);
   }
-
-  pending = await getAtendimentoComandoQueueSize();
 
   return {
     ok: true,

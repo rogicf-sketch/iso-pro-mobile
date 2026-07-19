@@ -347,7 +347,7 @@ export default function AtendimentoScreen() {
           }
         : null);
     return resumoConfirmacaoSessaoNuvem(payload, sessaoAtendimentoItens, loteRef);
-  }, [payload, sessaoAtendimentoItens, syncingComandos, nuvemAt, comandosPendentes]);
+  }, [payload, sessaoAtendimentoItens]);
 
   const saldoEstoqueMaterialBarras = useMemo(() => {
     if (!saldoPorCodigo) return null;
@@ -962,7 +962,6 @@ export default function AtendimentoScreen() {
           }
 
           const linhas = validacao.linhasRecibo;
-          const qtdItensRecibo = validacao.itensNuvem;
           const ctx = {
             documentoReferencia: doc,
             configuracoesSistema: payloadValidacao?.configuracoesSistema,
@@ -1182,7 +1181,7 @@ export default function AtendimentoScreen() {
         },
       ],
     );
-  }, [carregarNuvem, codigoBarras, doc, finalizarSessaoAtendimentoEPartilhar, nuvemAt, obterReservaProtocoloNovaSessao, payload, qtdBarras, recebedor, sincronizarAtendimentoEmBackground]);
+  }, [codigoBarras, doc, finalizarSessaoAtendimentoEPartilhar, nuvemAt, obterReservaProtocoloNovaSessao, payload, qtdBarras, recebedor, sincronizarAtendimentoEmBackground]);
 
   const registar = useCallback(async () => {
     if (!doc || !payload) return;
@@ -1326,7 +1325,6 @@ export default function AtendimentoScreen() {
       ]
     );
   }, [
-    carregarNuvem,
     codigoAlvoPlanejamento,
     doc,
     finalizarSessaoAtendimentoEPartilhar,
@@ -1696,8 +1694,10 @@ export default function AtendimentoScreen() {
                 !resumoSyncSessao.emDia && { color: colors.warn ?? '#fbbf24' },
               ]}
             >
-              {resumoSyncSessao.emDia
-                ? `Todos os ${resumoSyncSessao.itensNuvem} item(ns) confirmados na nuvem — pode finalizar com segurança.`
+              {syncingComandos || comandosPendentes > 0
+                ? `A enviar ${resumoSyncSessao.itensSessao} item(ns) para a nuvem… aguarde antes de finalizar.`
+                : resumoSyncSessao.emDia
+                  ? `Sessão pronta (${resumoSyncSessao.itensSessao} item(ns)). Toque em Finalizar para fazer a confirmação autoritativa na nuvem.`
                 : `Sincronização: ${resumoSyncSessao.itensSessao} nesta sessão · ${resumoSyncSessao.itensNuvem} na nuvem (${resumoSyncSessao.faltam} pendente(s)). Aguarde ou toque em «Carregar dados da nuvem».`}
             </Text>
           ) : null}
