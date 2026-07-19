@@ -27,7 +27,11 @@ export function mergeDocumentosPlanejamentoNoPayload(
     const prev = map.get(id);
     map.set(id, prev ? preferirDocumentoMaisCompleto(prev, d) : d);
   }
-  return [...map.values()];
+  const out = [...map.values()];
+  // Sem mudança real → devolve `base` (mesma referência). Evita re-render/loop em efeitos
+  // que dependem do payload (ex.: busca de pendência por material no Atendimento).
+  if (out.length === base.length && out.every((d, i) => d === base[i])) return base;
+  return out;
 }
 
 /** Carrega lista de desenhos em background (resumo leve → fallback fatia completa). */

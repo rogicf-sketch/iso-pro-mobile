@@ -477,10 +477,12 @@ export default function AtendimentoScreen() {
         );
         return prev;
       }
-      return {
-        ...prev,
-        documentos: mergeDocumentosPlanejamentoNoPayload((prev.documentos ?? []) as DocumentoPlanejamento[], docs),
-      };
+      const atuais = (prev.documentos ?? []) as DocumentoPlanejamento[];
+      const merged = mergeDocumentosPlanejamentoNoPayload(atuais, docs);
+      // Nada mudou → mantém a mesma referência do payload (evita loop no efeito
+      // de pendência por material, que depende do payload).
+      if (merged === atuais) return prev;
+      return { ...prev, documentos: merged };
     });
   }, []);
 

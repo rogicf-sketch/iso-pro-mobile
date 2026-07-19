@@ -29,6 +29,37 @@ describe('mergeDocumentosPlanejamentoNoPayload', () => {
     expect(merged).toHaveLength(2);
     expect(merged.find((d) => d.id === 'd1')?.itens).toHaveLength(1);
   });
+
+  it('devolve a mesma referência quando nada muda (evita loop de re-render no Atendimento)', () => {
+    const base: DocumentoPlanejamento[] = [
+      { id: 'd1', numero: 'AQ-1', revisao: 'A', itens: [{ id: 'i1', codigo: 'M1', quantidade: 1 }] },
+      { id: 'd2', numero: 'AQ-2', revisao: 'A', itens: [{ id: 'i2', codigo: 'M2', quantidade: 2 }] },
+    ];
+    // Mesmo conteúdo vindo da nuvem outra vez (objetos novos, mesma completude).
+    const extra: DocumentoPlanejamento[] = [
+      { id: 'd1', numero: 'AQ-1', revisao: 'A', itens: [{ id: 'i1', codigo: 'M1', quantidade: 1 }] },
+    ];
+    expect(mergeDocumentosPlanejamentoNoPayload(base, extra)).toBe(base);
+    expect(mergeDocumentosPlanejamentoNoPayload(base, [])).toBe(base);
+  });
+
+  it('devolve nova lista quando a nuvem traz documento novo ou mais completo', () => {
+    const base: DocumentoPlanejamento[] = [
+      { id: 'd1', numero: 'AQ-1', revisao: 'A', itens: [] },
+    ];
+    const comItens: DocumentoPlanejamento[] = [
+      { id: 'd1', numero: 'AQ-1', revisao: 'A', itens: [{ id: 'i1', codigo: 'M1', quantidade: 1 }] },
+    ];
+    const out1 = mergeDocumentosPlanejamentoNoPayload(base, comItens);
+    expect(out1).not.toBe(base);
+    expect(out1[0]?.itens).toHaveLength(1);
+
+    const out2 = mergeDocumentosPlanejamentoNoPayload(base, [
+      { id: 'd9', numero: 'AQ-9', revisao: 'A', itens: [] },
+    ]);
+    expect(out2).not.toBe(base);
+    expect(out2).toHaveLength(2);
+  });
 });
 
 describe('prefetchDocumentosParaAtendimento', () => {
