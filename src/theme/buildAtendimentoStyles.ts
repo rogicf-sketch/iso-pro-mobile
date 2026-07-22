@@ -6,11 +6,30 @@ import type { ThemeColors } from './tokens';
 export function buildAtendimentoStyles(c: ThemeColors) {
   return StyleSheet.create({
     scroll: { flex: 1, backgroundColor: c.bg },
-    container: { padding: 20, paddingBottom: 48 },
+    container: { padding: 16, paddingTop: 10, paddingBottom: 48 },
     center: { flex: 1, backgroundColor: c.bg, padding: 24, justifyContent: 'center' },
     title: { fontSize: 20, fontWeight: '800', color: c.text, marginBottom: 8 },
     hint: { fontSize: 14, color: c.textSecondary, lineHeight: 21, marginBottom: 16 },
     hintSmall: { fontSize: 12, color: c.textMuted, lineHeight: 18, marginBottom: 10 },
+    syncRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 8,
+      marginBottom: 10,
+    },
+    syncAtualizar: {
+      paddingVertical: 6,
+      paddingHorizontal: 10,
+      borderRadius: 8,
+      borderWidth: 1,
+      borderColor: c.border,
+      backgroundColor: c.secondaryBtn,
+    },
+    syncAtualizarTxt: {
+      color: c.id === 'claroSistema' ? c.text : '#e2e8f0',
+      fontWeight: '700',
+      fontSize: 12,
+    },
     recebedorWrap: { marginBottom: 8, zIndex: 20 },
     inputRecebedor: { marginBottom: 0 },
     sugestoesBox: {

@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useFocusEffect } from 'expo-router';
 import { useNavigation } from '@react-navigation/native';
-import { CloudSyncStrip } from '@/src/components/mobile/CloudSyncStrip';
 import { AtendimentoOperacaoOverlay } from '@/src/components/mobile/AtendimentoOperacaoOverlay';
+import { CloudSyncStrip } from '@/src/components/mobile/CloudSyncStrip';
 import { ModuleScreenHeader } from '@/src/components/mobile/ModuleScreenHeader';
-import { PrimaryActionButton } from '@/src/components/mobile/PrimaryActionButton';
 import { SectionCard } from '@/src/components/mobile/SectionCard';
 import { StatPillRow } from '@/src/components/mobile/StatPillRow';
 import {
@@ -1604,73 +1603,53 @@ export default function AtendimentoScreen() {
       keyboardShouldPersistTaps="handled"
     >
       <ModuleScreenHeader
-        kicker="Operação de campo"
-        title="Atendimento"
-        helpText="Carregue a nuvem, indique quem recebe, escaneie ou abra o desenho e registe as baixas. A gravação é imediata neste aparelho; a sincronização com a nuvem corre em segundo plano (faixa «Nuvem» em cima). O mesmo protocolo (ATD) segue até mudar o recebedor ou finalizar a sessão."
+        helpText="Indique quem recebe, escaneie ou abra o desenho e registe as baixas. A sincronização com a nuvem corre em segundo plano (faixa «Nuvem»)."
         showHelp={mostrarTextosAjudaModulos}
       />
 
-      <CloudSyncStrip
-        configured={configured}
-        error={loadErr}
-        errorLabel="Erro ao carregar"
-        loading={(loading && !payload) || syncingComandos || finalizandoSessao}
-        pendingLabel={
-          finalizandoSessao
-            ? 'A confirmar todas as baixas na nuvem…'
-            : syncingComandos
-              ? 'A sincronizar atendimento…'
-              : resumoSyncSessao && !resumoSyncSessao.emDia
-                ? `${resumoSyncSessao.itensSessao} na sessão · ${resumoSyncSessao.itensNuvem} confirmados na nuvem`
-                : resumoSyncSessao?.emDia
-                  ? `${resumoSyncSessao.itensNuvem} item(ns) confirmados na nuvem`
-                  : comandosPendentes > 0
-                    ? `${comandosPendentes} atendimento(s) na fila offline`
-                    : loading && !payload
-                      ? 'A carregar dados…'
-                      : undefined
-        }
-        updatedAt={nuvemAt}
-      />
+      <View style={styles.syncRow}>
+        <View style={{ flex: 1 }}>
+          <CloudSyncStrip
+            configured={configured}
+            error={loadErr}
+            errorLabel="Erro ao carregar"
+            loading={(loading && !payload) || syncingComandos || finalizandoSessao}
+            pendingLabel={
+              finalizandoSessao
+                ? 'A confirmar baixas na nuvem…'
+                : syncingComandos
+                  ? 'A sincronizar…'
+                  : resumoSyncSessao && !resumoSyncSessao.emDia
+                    ? `${resumoSyncSessao.itensSessao} sessão · ${resumoSyncSessao.itensNuvem} nuvem`
+                    : resumoSyncSessao?.emDia
+                      ? `${resumoSyncSessao.itensNuvem} na nuvem`
+                      : comandosPendentes > 0
+                        ? `${comandosPendentes} na fila offline`
+                        : loading && !payload
+                          ? 'A carregar…'
+                          : undefined
+            }
+            updatedAt={nuvemAt}
+          />
+        </View>
+        <Pressable
+          accessibilityLabel="Actualizar dados da nuvem"
+          accessibilityRole="button"
+          disabled={loading}
+          onPress={() => void carregarNuvem()}
+          style={[styles.syncAtualizar, loading ? styles.btnOff : null]}
+        >
+          <Text style={styles.syncAtualizarTxt}>{loading ? '…' : 'Actualizar'}</Text>
+        </Pressable>
+      </View>
 
-      {payload ? (
-        <StatPillRow
-          items={[
-            {
-              label: 'Desenhos',
-              value: carregandoDesenhos
-                ? 'a carregar…'
-                : (payload.documentos?.length ?? 0) > 0
-                  ? (payload.documentos!.length > MAX_DESENHOS_EM_MEMORIA
-                      ? 'sob demanda'
-                      : `${payload.documentos!.length} carreg.`)
-                  : 'sob demanda',
-            },
-            {
-              label: 'Recebimentos',
-              value: payload.recebimentos?.length ?? 0,
-            },
-            { label: 'Colaboradores', value: payload.colaboradores?.length ?? 0 },
-          ]}
-        />
-      ) : null}
-
-      <PrimaryActionButton
-        disabled={loading}
-        label="Carregar dados da nuvem"
-        loading={loading}
-        loadingLabel="A carregar da nuvem…"
-        onPress={() => void carregarNuvem()}
-      />
       {payload && (payload.recebimentos?.length ?? 0) === 0 ? (
         <Text style={styles.warn}>
           Sem recebimentos no snapshot — confira se o PC enviou dados para a nuvem (mesmo Supabase no `.env`).
         </Text>
       ) : null}
-      {payload && (payload.documentos?.length ?? 0) === 0 ? (
-        <Text style={styles.hintSmall}>
-          Desenhos carregam ao escanear código ou abrir documento — não é preciso baixar todos de uma vez.
-        </Text>
+      {!payload && !loading ? (
+        <Text style={styles.hintSmall}>Toque em «Actualizar» para carregar a nuvem antes de registar.</Text>
       ) : null}
       <Text style={styles.label}>Quem recebeu / retirou o material *</Text>
       {mostrarTextosAjudaModulos ? (
