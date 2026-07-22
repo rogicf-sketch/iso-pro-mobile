@@ -2,15 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import { useDebouncedEffect } from '@/src/lib/useDebouncedEffect';
 import { CloudSyncStrip } from '@/src/components/mobile/CloudSyncStrip';
-import { ModuleScreenHeader } from '@/src/components/mobile/ModuleScreenHeader';
-import { PrimaryActionButton } from '@/src/components/mobile/PrimaryActionButton';
 import { StatPillRow } from '@/src/components/mobile/StatPillRow';
 import { buildConsultaStyles } from '@/src/theme/buildConsultaStyles';
-import { buildMobileShellStyles } from '@/src/theme/buildMobileShellStyles';
 import { useMobileUiPreferences } from '@/src/theme/MobileUiPreferencesContext';
 import { useTheme } from '@/src/theme/ThemeContext';
 import {
-  FlatList,
   Modal,
   Pressable,
   ScrollView,
@@ -22,7 +18,6 @@ import {
 import { appAlert } from '@/src/lib/appDialog';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import {
-  exemplosNumerosDocumentos,
   filtrarDocumentosPlanejamentoPorTexto,
   resolverBuscaDocumentoPorNumero,
 } from '@/src/lib/documentoBusca';
@@ -30,7 +25,7 @@ import { fetchSnapshotSlices } from '@/src/lib/snapshot';
 import { SNAPSHOT_MOBILE_CONSULTA_READ_KEYS } from '@/src/lib/snapshotSliceKeys';
 import { useSnapshotRefreshOnAppActive } from '@/src/lib/useSnapshotRefreshOnAppActive';
 import { hasSupabaseConfig } from '@/src/lib/config';
-import { formatQuantidadeExibicao } from '@/src/lib/formatQuantidade';
+import { formatQuantidadeComUnidade, formatQuantidadeExibicao } from '@/src/lib/formatQuantidade';
 import { playScanBeep } from '@/src/lib/playScanBeep';
 import {
   encontrarMaterialPorCodigoOuBarras,
@@ -38,7 +33,6 @@ import {
   quantidadeAtendidaLinha,
 } from '@/src/lib/registrarAtendimento';
 import {
-  exemplosNotasRecebimentos,
   filtrarRecebimentosPorTextoInteligente,
   resolverBuscaRecebimentoPorNota,
   rotuloNotaRomaneioRecebimento,
@@ -72,10 +66,6 @@ const PAGE_SIZE_CONSULTA = 50;
 
 function deepClone<T>(v: T): T {
   return JSON.parse(JSON.stringify(v));
-}
-
-function norm(s: string): string {
-  return s.trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
 function mesmoDocumentoSelecionado(
@@ -124,12 +114,16 @@ export default function ConsultaScreen() {
   const { sec: secParam } = useLocalSearchParams<{ sec?: string | string[] }>();
   const secFocus =
     typeof secParam === 'string' ? secParam : Array.isArray(secParam) ? secParam[0] : undefined;
-  /** `recebimento` = NF/romaneio; resto (aba Consulta ou `?sec=documentos`) = desenhos + código/barras. */
-  const somenteRecebimento = secFocus === 'recebimento';
-  const somenteDocumentos = !somenteRecebimento;
+  /** `recebimento` | `material` | resto/`documentos` = desenhos. */
+  type ModoConsulta = 'documentos' | 'recebimento' | 'material';
+  const modoConsulta: ModoConsulta =
+    secFocus === 'recebimento' ? 'recebimento' : secFocus === 'material' ? 'material' : 'documentos';
+  const somenteRecebimento = modoConsulta === 'recebimento';
+  const somenteDocumentos = modoConsulta === 'documentos';
+  const somenteMaterial = modoConsulta === 'material';
 
   const escolherModoConsulta = useCallback(
-    (modo: 'documentos' | 'recebimento') => {
+    (modo: ModoConsulta) => {
       router.setParams({ sec: modo });
     },
     [router],
@@ -138,11 +132,8 @@ export default function ConsultaScreen() {
   const { colors } = useTheme();
   const { mostrarTextosAjudaModulos } = useMobileUiPreferences();
   const styles = useMemo(() => buildConsultaStyles(colors), [colors]);
-  const shell = useMemo(() => buildMobileShellStyles(colors), [colors]);
   const configured = useMemo(() => hasSupabaseConfig(), []);
   const scrollRef = useRef<ScrollView>(null);
-  const ySectionDocumentos = useRef(0);
-  const ySectionRecebimento = useRef(0);
   const [loading, setLoading] = useState(false);
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [nuvemAt, setNuvemAt] = useState<string | null>(null);
@@ -158,7 +149,6 @@ export default function ConsultaScreen() {
 
   const [buscaDoc, setBuscaDoc] = useState('');
   const [msgDoc, setMsgDoc] = useState<string | null>(null);
-  const [candidatosConsultaDoc, setCandidatosConsultaDoc] = useState<DocumentoPlanejamento[] | null>(null);
   const [docConsulta, setDocConsulta] = useState<DocumentoPlanejamento | null>(null);
 
   const [codigoConsulta, setCodigoConsulta] = useState('');
@@ -170,7 +160,6 @@ export default function ConsultaScreen() {
 
   const [buscaRecNf, setBuscaRecNf] = useState('');
   const [msgRec, setMsgRec] = useState<string | null>(null);
-  const [candidatosRecConsulta, setCandidatosRecConsulta] = useState<Recebimento[] | null>(null);
   const [recConsulta, setRecConsulta] = useState<Recebimento | null>(null);
 
   const [scannerOpen, setScannerOpen] = useState(false);
@@ -180,7 +169,6 @@ export default function ConsultaScreen() {
   const hidratarDocumento = useCallback(async (d: DocumentoPlanejamento) => {
     setDocConsulta(deepClone(d));
     setMsgDoc(null);
-    setCandidatosConsultaDoc(null);
     try {
       const cloud = await readDocumentoPlanejamentoFromCloud({
         documentoId: d.id,
@@ -198,7 +186,6 @@ export default function ConsultaScreen() {
   const hidratarRecebimento = useCallback(async (r: Recebimento) => {
     setRecConsulta(deepClone(r));
     setMsgRec(null);
-    setCandidatosRecConsulta(null);
     try {
       const cloud = await readRecebimentoFromCloud(String(r.id));
       if (cloud.recebimento) {
@@ -354,31 +341,21 @@ export default function ConsultaScreen() {
 
   useSnapshotRefreshOnAppActive(carregarNuvem);
 
-  /** Scroll automático só uma vez por sec=… — não repetir a cada loading (causa “tela a mexer sozinha”). */
+  /** Ao mudar de aba (Desenhos / Recebimentos / Material), volta ao topo da lista. */
   const scrolledForSecRef = useRef<string | null>(null);
   useEffect(() => {
-    if (secFocus !== 'documentos' && secFocus !== 'recebimento') {
+    if (secFocus !== 'documentos' && secFocus !== 'recebimento' && secFocus !== 'material') {
       scrolledForSecRef.current = null;
       return;
     }
-    if (loading) return;
     if (scrolledForSecRef.current === secFocus) return;
     scrolledForSecRef.current = secFocus;
-    const scrollToSection = () => {
-      const y =
-        secFocus === 'documentos'
-          ? ySectionDocumentos.current
-          : secFocus === 'recebimento'
-            ? ySectionRecebimento.current
-            : 0;
-      scrollRef.current?.scrollTo({ y: Math.max(0, y - 16), animated: true });
-    };
-    const t1 = setTimeout(scrollToSection, 350);
-    return () => clearTimeout(t1);
-  }, [secFocus, loading]);
+    scrollRef.current?.scrollTo({ y: 0, animated: true });
+  }, [secFocus]);
 
   const docFiltradosRapido = useMemo(() => {
     if (docsEscalaOk) {
+      if (!docConsulta && buscaDoc.trim().length < 1) return [];
       if (!docConsulta) return docsCloud;
       const hit = docsCloud.find((d) => mesmoDocumentoSelecionado(docConsulta, d));
       return hit ? [hit] : [docConsulta];
@@ -392,6 +369,7 @@ export default function ConsultaScreen() {
 
   const recFiltradosRapido = useMemo(() => {
     if (recsEscalaOk) {
+      if (!recConsulta && buscaRecNf.trim().length < 1) return [];
       if (!recConsulta) return recsCloud;
       const hit = recsCloud.find((r) => mesmoRecebimentoSelecionado(recConsulta, r));
       return hit ? [hit] : [recConsulta];
@@ -410,49 +388,31 @@ export default function ConsultaScreen() {
     return hit ? [hit] : [docConsulta];
   }, [docFiltradosRapido, docConsulta]);
 
-  const listaCompletaDocumentosParaExibir = useMemo(() => {
-    if (docsEscalaOk) {
-      if (!docConsulta) return docsCloud;
-      const hit = docsCloud.find((d) => mesmoDocumentoSelecionado(docConsulta, d));
-      return hit ? [hit] : [docConsulta];
-    }
-    const all = (payload?.documentos ?? []) as DocumentoPlanejamento[];
-    if (!docConsulta) return all;
-    const hit = all.find((d) => mesmoDocumentoSelecionado(docConsulta, d));
-    return hit ? [hit] : [docConsulta];
-  }, [docsEscalaOk, docsCloud, payload?.documentos, docConsulta]);
-
   const recFiltradosParaExibir = useMemo(() => {
     if (!recConsulta) return recFiltradosRapido;
     const hit = recFiltradosRapido.find((r) => mesmoRecebimentoSelecionado(recConsulta, r));
     return hit ? [hit] : [recConsulta];
   }, [recFiltradosRapido, recConsulta]);
 
-  const listaBuscaUnificadaRecebimentos = useMemo(() => {
-    if (recConsulta) return recFiltradosParaExibir;
-    if (candidatosRecConsulta && candidatosRecConsulta.length > 0) return candidatosRecConsulta;
-    return recFiltradosParaExibir;
-  }, [recConsulta, candidatosRecConsulta, recFiltradosParaExibir]);
+  const tituloListaDocumentos = useMemo(() => {
+    if (docConsulta) {
+      return 'Desenho seleccionado — altere a pesquisa para ver outros resultados';
+    }
+    if (docsEscalaOk) {
+      return `Resultados (${docFiltradosParaExibir.length} de ${docsTotal}) — toque para abrir`;
+    }
+    return `Resultados (${docFiltradosParaExibir.length}${docFiltradosParaExibir.length >= 50 ? '+' : ''}) — toque para abrir`;
+  }, [docConsulta, docsEscalaOk, docFiltradosParaExibir.length, docsTotal]);
 
   const tituloListaRecebimentos = useMemo(() => {
-    if (candidatosRecConsulta && candidatosRecConsulta.length > 0) {
-      return `Escolha o recebimento (${candidatosRecConsulta.length}${candidatosRecConsulta.length >= 50 ? '+' : ''}) — toque para ver`;
-    }
     if (recConsulta) {
-      return 'Nota em consulta — altere o texto acima para voltar a ver todos os resultados filtrados';
+      return 'Recebimento seleccionado — altere a pesquisa para ver outros resultados';
     }
     if (recsEscalaOk) {
-      return `Resultados (${recsCloud.length} de ${recsTotal}) — digite para filtrar · toque para ver`;
+      return `Resultados (${recFiltradosParaExibir.length} de ${recsTotal}) — toque para abrir`;
     }
-    return `Resultados ao digitar (${listaBuscaUnificadaRecebimentos.length}${listaBuscaUnificadaRecebimentos.length >= 50 ? '+' : ''}) — toque para ver`;
-  }, [
-    candidatosRecConsulta,
-    recConsulta,
-    recsEscalaOk,
-    recsCloud.length,
-    recsTotal,
-    listaBuscaUnificadaRecebimentos.length,
-  ]);
+    return `Resultados (${recFiltradosParaExibir.length}${recFiltradosParaExibir.length >= 50 ? '+' : ''}) — toque para abrir`;
+  }, [recConsulta, recsEscalaOk, recFiltradosParaExibir.length, recsTotal]);
 
   const tentarAutoSelecionarConsulta = useCallback(() => {
     const list = docsEscalaOk ? docsCloud : ((payload?.documentos as DocumentoPlanejamento[] | undefined) ?? []);
@@ -483,133 +443,6 @@ export default function ConsultaScreen() {
       void hidratarRecebimento(res.recs[0]);
     }
   }, [buscaRecNf, recsEscalaOk, recsCloud, payload, hidratarRecebimento]);
-
-  const buscarRecebimentoConsulta = useCallback(async () => {
-    setMsgRec(null);
-    setRecConsulta(null);
-    setCandidatosRecConsulta(null);
-    const alvo = norm(buscaRecNf);
-    if (!alvo) {
-      setMsgRec('Informe NF, romaneio ou trecho do fornecedor.');
-      return;
-    }
-    const ok = await carregarPaginaRecebimentos(buscaRecNf);
-    if (ok) {
-      const list = (
-        await listRecebimentosPageFromCloud({
-          busca: buscaRecNf,
-          offset: 0,
-          limit: PAGE_SIZE_CONSULTA,
-        })
-      ).recebimentos.map(wireRecebimentoParaConsulta);
-      const res = resolverBuscaRecebimentoPorNota(list, buscaRecNf);
-      if (res.kind === 'none') {
-        setMsgRec(`Nenhum recebimento combina com «${buscaRecNf.trim()}».`);
-        return;
-      }
-      if (res.kind === 'one') {
-        await hidratarRecebimento(res.rec);
-        return;
-      }
-      if (res.kind === 'sameNotaVarios') {
-        setMsgRec(`${res.recs.length} recebimentos com a mesma NF — a mostrar o primeiro.`);
-        await hidratarRecebimento(res.recs[0]);
-        return;
-      }
-      setCandidatosRecConsulta(res.recs);
-      setMsgRec(`${res.recs.length} recebimentos correspondem — toque numa linha para ver.`);
-      return;
-    }
-    const list = payload?.recebimentos as Recebimento[] | undefined;
-    if (!list?.length) {
-      setMsgRec('Carregue os dados da nuvem primeiro.');
-      return;
-    }
-    const res = resolverBuscaRecebimentoPorNota(list, buscaRecNf);
-    if (res.kind === 'none') {
-      const ex = exemplosNotasRecebimentos(list, 6);
-      setMsgRec(
-        ex.length
-          ? `Nenhum recebimento combina com «${buscaRecNf.trim()}». Exemplos de NF: ${ex.join(' · ')}.`
-          : 'Nenhum recebimento encontrado.',
-      );
-      return;
-    }
-    if (res.kind === 'one') {
-      await hidratarRecebimento(res.rec);
-      return;
-    }
-    if (res.kind === 'sameNotaVarios') {
-      setMsgRec(`${res.recs.length} recebimentos com a mesma NF — a mostrar o primeiro.`);
-      await hidratarRecebimento(res.recs[0]);
-      return;
-    }
-    setCandidatosRecConsulta(res.recs);
-    setMsgRec(`${res.recs.length} recebimentos correspondem — toque numa linha para ver.`);
-  }, [buscaRecNf, carregarPaginaRecebimentos, hidratarRecebimento, payload]);
-
-  const buscarDocumentoConsulta = useCallback(async () => {
-    setMsgDoc(null);
-    setDocConsulta(null);
-    setCandidatosConsultaDoc(null);
-    const alvo = norm(buscaDoc);
-    if (!alvo) {
-      setMsgDoc('Informe o número do documento.');
-      return;
-    }
-    const ok = await carregarPaginaDocumentos(buscaDoc);
-    if (ok) {
-      const list = (
-        await listDocumentosPlanejamentoPageFromCloud({
-          busca: buscaDoc,
-          offset: 0,
-          limit: PAGE_SIZE_CONSULTA,
-        })
-      ).documentos.map(wireDocumentoParaConsulta);
-      const res = resolverBuscaDocumentoPorNumero(list, buscaDoc);
-      if (res.kind === 'none') {
-        setMsgDoc(`Nenhum desenho combina com «${buscaDoc.trim()}».`);
-        return;
-      }
-      if (res.kind === 'one') {
-        await hidratarDocumento(res.doc);
-        return;
-      }
-      if (res.kind === 'sameNumeroVarios') {
-        setMsgDoc(`${res.docs.length} documentos com o mesmo número — a mostrar o primeiro.`);
-        await hidratarDocumento(res.docs[0]);
-        return;
-      }
-      setCandidatosConsultaDoc(res.docs);
-      setMsgDoc(`${res.docs.length} desenhos correspondem — toque numa linha para abrir.`);
-      return;
-    }
-    if (!payload?.documentos?.length) {
-      setMsgDoc('Carregue os dados da nuvem primeiro.');
-      return;
-    }
-    const res = resolverBuscaDocumentoPorNumero(payload.documentos as DocumentoPlanejamento[], buscaDoc);
-    if (res.kind === 'none') {
-      const ex = exemplosNumerosDocumentos(payload.documentos as DocumentoPlanejamento[], 6);
-      setMsgDoc(
-        ex.length
-          ? `Nenhum desenho combina com «${buscaDoc.trim()}». Exemplos: ${ex.join(' · ')}.`
-          : 'Nenhum documento encontrado.',
-      );
-      return;
-    }
-    if (res.kind === 'one') {
-      await hidratarDocumento(res.doc);
-      return;
-    }
-    if (res.kind === 'sameNumeroVarios') {
-      setMsgDoc(`${res.docs.length} documentos com o mesmo número — a mostrar o primeiro.`);
-      await hidratarDocumento(res.docs[0]);
-      return;
-    }
-    setCandidatosConsultaDoc(res.docs);
-    setMsgDoc(`${res.docs.length} desenhos correspondem — toque numa linha para abrir.`);
-  }, [buscaDoc, carregarPaginaDocumentos, hidratarDocumento, payload]);
 
   const executarConsultaCodigo = useCallback(
     async (termo: string) => {
@@ -687,7 +520,6 @@ export default function ConsultaScreen() {
       if (raw.length < 1) {
         setDocConsulta(null);
         setMsgDoc(null);
-        setCandidatosConsultaDoc(null);
         // Só recarrega a 1.ª página se o utilizador limpou a pesquisa (não em loop).
         if (prev.length > 0) {
           void carregarPaginaDocumentosRef.current('');
@@ -711,7 +543,6 @@ export default function ConsultaScreen() {
       if (raw.length < 1) {
         setRecConsulta(null);
         setMsgRec(null);
-        setCandidatosRecConsulta(null);
         if (prev.length > 0) {
           void carregarPaginaRecebimentosRef.current('');
         }
@@ -725,10 +556,10 @@ export default function ConsultaScreen() {
     320,
   );
 
-  /** Consulta por código: a partir de 3 caracteres, após pausa. */
+  /** Consulta por código: a partir de 3 caracteres, após pausa (só na aba Material). */
   useDebouncedEffect(
     () => {
-      if (!payload) return;
+      if (!payload || !somenteMaterial) return;
       const t = codigoConsulta.trim();
       if (t.length < 3) {
         setLinhasPorMaterial(null);
@@ -738,7 +569,7 @@ export default function ConsultaScreen() {
       }
       void executarConsultaCodigo(codigoConsulta);
     },
-    [codigoConsulta, payload, executarConsultaCodigo],
+    [codigoConsulta, payload, somenteMaterial, executarConsultaCodigo],
     480,
   );
 
@@ -778,72 +609,145 @@ export default function ConsultaScreen() {
     );
   }
 
-  return (
-    <ScrollView
-      ref={scrollRef}
-      style={styles.scroll}
-      contentContainerStyle={[styles.container, shell.screenPad]}
-      keyboardShouldPersistTaps="handled"
-    >
-      <ModuleScreenHeader
-        kicker="Só leitura · nuvem"
-        title="Consulta"
-        helpText={
-          somenteRecebimento
-            ? 'Pesquisa por nota fiscal, romaneio ou fornecedor. Não grava alterações.'
-            : 'Desenhos no planejamento e consulta por código de material (inclui scan). Não grava alterações.'
-        }
-        showHelp={mostrarTextosAjudaModulos}
-      />
 
-      <View style={styles.modoRow} accessibilityRole="tablist">
-        <Pressable
-          accessibilityRole="tab"
-          accessibilityState={{ selected: somenteDocumentos }}
-          onPress={() => escolherModoConsulta('documentos')}
-          style={[styles.modoBtn, somenteDocumentos ? styles.modoBtnOn : null]}
-        >
-          <Text style={[styles.modoBtnTxt, somenteDocumentos ? styles.modoBtnTxtOn : null]}>Desenhos</Text>
-        </Pressable>
-        <Pressable
-          accessibilityRole="tab"
-          accessibilityState={{ selected: somenteRecebimento }}
-          onPress={() => escolherModoConsulta('recebimento')}
-          style={[styles.modoBtn, somenteRecebimento ? styles.modoBtnOn : null]}
-        >
-          <Text style={[styles.modoBtnTxt, somenteRecebimento ? styles.modoBtnTxtOn : null]}>Recebimentos</Text>
-        </Pressable>
+  const helpConsulta = somenteRecebimento
+    ? 'Pesquisa por nota fiscal, romaneio ou fornecedor. Não grava alterações.'
+    : somenteMaterial
+      ? 'Consulta por código de material ou código de barras (inclui scan). Não grava alterações.'
+      : 'Pesquise desenhos do planejamento. Digite e toque no resultado. Não grava alterações.';
+
+  return (
+    <View style={styles.screen}>
+      <View style={styles.stickyHeader}>
+        {mostrarTextosAjudaModulos ? <Text style={styles.hintSmall}>{helpConsulta}</Text> : null}
+
+        <View style={styles.modoRow} accessibilityRole="tablist">
+          <Pressable
+            accessibilityRole="tab"
+            accessibilityState={{ selected: somenteDocumentos }}
+            onPress={() => escolherModoConsulta('documentos')}
+            style={[styles.modoBtn, somenteDocumentos ? styles.modoBtnOn : null]}
+          >
+            <Text style={[styles.modoBtnTxt, somenteDocumentos ? styles.modoBtnTxtOn : null]}>Desenhos</Text>
+          </Pressable>
+          <Pressable
+            accessibilityRole="tab"
+            accessibilityState={{ selected: somenteRecebimento }}
+            onPress={() => escolherModoConsulta('recebimento')}
+            style={[styles.modoBtn, somenteRecebimento ? styles.modoBtnOn : null]}
+          >
+            <Text style={[styles.modoBtnTxt, somenteRecebimento ? styles.modoBtnTxtOn : null]}>Recebimentos</Text>
+          </Pressable>
+          <Pressable
+            accessibilityRole="tab"
+            accessibilityState={{ selected: somenteMaterial }}
+            onPress={() => escolherModoConsulta('material')}
+            style={[styles.modoBtn, somenteMaterial ? styles.modoBtnOn : null]}
+          >
+            <Text style={[styles.modoBtnTxt, somenteMaterial ? styles.modoBtnTxtOn : null]}>Material</Text>
+          </Pressable>
+        </View>
+
+        <View style={styles.syncRow}>
+          <View style={{ flex: 1 }}>
+            <CloudSyncStrip configured={configured} error={loadErr} loading={loading && !payload} updatedAt={nuvemAt} />
+          </View>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Actualizar dados da nuvem"
+            disabled={loading}
+            onPress={() => void carregarNuvem()}
+            style={[styles.syncAtualizar, loading ? styles.btnOff : null]}
+          >
+            <Text style={styles.syncAtualizarTxt}>{loading ? '…' : 'Actualizar'}</Text>
+          </Pressable>
+        </View>
+
+        {somenteDocumentos ? (
+          <View>
+            <Text style={styles.stickySubTit}>Pesquisar desenho</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="Número ou descrição do desenho"
+              placeholderTextColor={colors.placeholder}
+              value={buscaDoc}
+              onChangeText={(t) => {
+                setBuscaDoc(t);
+                setDocConsulta(null);
+                setMsgDoc(null);
+              }}
+              onSubmitEditing={() => tentarAutoSelecionarConsulta()}
+              returnKeyType="search"
+              autoCapitalize="characters"
+            />
+          </View>
+        ) : null}
+
+        {somenteRecebimento ? (
+          <View>
+            <Text style={styles.stickySubTit}>Pesquisar recebimento</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="NF, romaneio, fornecedor ou código do item"
+              placeholderTextColor={colors.placeholder}
+              value={buscaRecNf}
+              onChangeText={(t) => {
+                setBuscaRecNf(t);
+                setRecConsulta(null);
+                setMsgRec(null);
+              }}
+              onSubmitEditing={() => tentarAutoSelecionarRecConsulta()}
+              returnKeyType="search"
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+          </View>
+        ) : null}
+
+        {somenteMaterial ? (
+          <View>
+            <Text style={styles.stickySubTit}>Código ou código de barras</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="Código do material ou leitura do código de barras"
+              placeholderTextColor={colors.placeholder}
+              value={codigoConsulta}
+              onChangeText={setCodigoConsulta}
+              autoCapitalize="none"
+              autoCorrect={false}
+              returnKeyType="search"
+              onSubmitEditing={consultarPorCodigo}
+            />
+            <View style={styles.rowBarras}>
+              <Pressable
+                style={[styles.btnSec, styles.btnBarras, (!payload || loading) && styles.btnOff]}
+                onPress={abrirScanner}
+                disabled={!payload || loading}
+              >
+                <Text style={styles.btnTextSec}>Escanear</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.btnOk, styles.btnBarrasGo, (!payload || loading) && styles.btnOff]}
+                onPress={consultarPorCodigo}
+                disabled={!payload || loading}
+              >
+                <Text style={styles.btnText}>Consultar</Text>
+              </Pressable>
+            </View>
+          </View>
+        ) : null}
       </View>
 
-      <CloudSyncStrip configured={configured} error={loadErr} loading={loading && !payload} updatedAt={nuvemAt} />
-
-      {payload ? (
-        <StatPillRow
-          items={
-            somenteRecebimento
-              ? [
-                  { label: 'Recebimentos', value: recsEscalaOk ? recsTotal : (payload.recebimentos?.length ?? 0) },
-                  { label: 'Materiais', value: payload.materiais?.length ?? 0 },
-                  { label: 'Nesta página', value: recsCloud.length },
-                ]
-              : [
-                  {
-                    label: 'Total desenhos',
-                    value: docsEscalaOk ? docsTotal : (payload.documentos?.length ?? 0),
-                    tone: 'emphasis' as const,
-                  },
-                  { label: 'Materiais', value: payload.materiais?.length ?? 0 },
-                  { label: 'Nesta página', value: docsCloud.length },
-                ]
-          }
-        />
-      ) : null}
-
-      <PrimaryActionButton disabled={loading} label="Carregar dados da nuvem" loading={loading} onPress={carregarNuvem} />
+      <ScrollView
+        ref={scrollRef}
+        style={styles.scroll}
+        contentContainerStyle={styles.container}
+        keyboardShouldPersistTaps="handled"
+      >
       {somenteDocumentos && payload && docsEscalaOk && docsTotal === 0 && !msgDoc ? (
         <Text style={styles.warn}>
           Ainda não há desenhos nas tabelas de escala (por isso o total está 0). Isto não deixa o telemóvel lento — a
-          pesquisa continua paginada. Toque em «Carregar dados da nuvem» outra vez ou, no PC, em Configurações, active a
+          pesquisa continua paginada. Toque em «Actualizar» outra vez ou, no PC, em Configurações, active a
           estrutura de escala de desenhos.
         </Text>
       ) : null}
@@ -867,105 +771,24 @@ export default function ConsultaScreen() {
       ) : null}
 
       {somenteDocumentos ? (
-      <View
-        onLayout={(e) => {
-          ySectionDocumentos.current = e.nativeEvent.layout.y;
-        }}
-      >
-      <Text style={styles.subTit}>Desenhos cadastrados</Text>
-      {mostrarTextosAjudaModulos ? (
-        <Text style={styles.hintSmall}>
-          Pesquisa na nuvem (paginada). O total no contador vem da nuvem sem baixar todos os desenhos — mesmo com 20 mil
-          cadastrados o telemóvel não fica lento. Digite número ou descrição; toque para abrir o detalhe.
-          {buscandoDocs ? ' A actualizar…' : ''}
-        </Text>
+      <View>
+      {msgDoc ? <Text style={styles.warn}>{msgDoc}</Text> : null}
+      {buscaDoc.trim().length === 0 && !docConsulta ? (
+        <Text style={styles.emptyHint}>Digite número ou descrição para pesquisar.</Text>
       ) : null}
-      <TextInput
-        style={styles.input}
-        placeholder="Comece a digitar — resultados na hora"
-        placeholderTextColor={colors.placeholder}
-        value={buscaDoc}
-        onChangeText={(t) => {
-          setBuscaDoc(t);
-          setDocConsulta(null);
-          setCandidatosConsultaDoc(null);
-          setMsgDoc(null);
-        }}
-        autoCapitalize="characters"
-      />
-      {payload && (docsEscalaOk ? docsCloud.length > 0 || buscaDoc.trim().length > 0 : (payload.documentos?.length ?? 0) > 0) &&
-      buscaDoc.trim().length > 0 ? (
-        <View style={{ marginBottom: 12 }}>
-          <Text style={[styles.hintSmall, { fontWeight: '700', marginBottom: 8 }]}>
-            {docConsulta
-              ? 'Documento em consulta — altere o texto acima para voltar a ver todos os resultados filtrados'
-              : docsEscalaOk
-                ? `Resultados (${docFiltradosParaExibir.length} de ${docsTotal} cadastrados) — toque para ver`
-                : `Resultados ao digitar (${docFiltradosParaExibir.length}${docFiltradosParaExibir.length >= 50 ? '+' : ''}) — toque para ver`}
-          </Text>
+      {buscaDoc.trim().length > 0 || docConsulta ? (
+        <View style={styles.listaBox}>
+          <Text style={styles.listaTitulo}>{tituloListaDocumentos}</Text>
           {docFiltradosParaExibir.length === 0 ? (
             <Text style={styles.warn}>
               Nenhum desenho combina com «{buscaDoc.trim()}». Tente outro trecho do número ou da descrição.
             </Text>
           ) : (
-            <FlatList
-              style={{ maxHeight: 280 }}
-              nestedScrollEnabled
-              scrollEnabled={false}
-              keyboardShouldPersistTaps="handled"
-              data={docFiltradosParaExibir}
-              keyExtractor={(d) => `rapido-${String(d.id)}-${String(d.numero)}-${String(d.revisao)}`}
-              initialNumToRender={14}
-              maxToRenderPerBatch={16}
-              windowSize={5}
-              removeClippedSubviews
-              renderItem={({ item: d }) => {
-                const sel = mesmoDocumentoSelecionado(docConsulta, d);
-                return (
-                  <Pressable
-                    style={[styles.docLinha, sel && styles.docLinhaSelected]}
-                    accessibilityRole="button"
-                    accessibilityState={{ selected: sel }}
-                    onPress={() => {
-                      setBuscaDoc(String(d.numero ?? ''));
-                      void hidratarDocumento(d);
-                    }}
-                  >
-                    <Text style={[styles.docLinhaTit, sel && styles.docLinhaTitSelected]}>
-                      {d.numero ?? '—'} — rev. {d.revisao ?? '—'}
-                    </Text>
-                    <Text style={[styles.docLinhaSub, sel && styles.docLinhaSubSelected]} numberOfLines={2}>
-                      {d.descricao ?? ''}
-                    </Text>
-                  </Pressable>
-                );
-              }}
-            />
-          )}
-        </View>
-      ) : null}
-      {payload && docsEscalaOk && buscaDoc.trim().length === 0 ? (
-        <View style={{ marginBottom: 12 }}>
-          <Text style={[styles.hintSmall, { fontWeight: '700', marginBottom: 8 }]}>
-            {docConsulta
-              ? 'Documento em consulta — use a pesquisa para localizar outro desenho'
-              : `Total ${docsTotal} desenhos · a mostrar ${docsCloud.length} — digite para filtrar · toque para ver`}
-          </Text>
-          <FlatList
-            style={{ maxHeight: 220 }}
-            nestedScrollEnabled
-            scrollEnabled={false}
-            keyboardShouldPersistTaps="handled"
-            data={listaCompletaDocumentosParaExibir}
-            keyExtractor={(d) => `lista-doc-${String(d.id)}-${String(d.numero)}-${String(d.revisao)}`}
-            initialNumToRender={12}
-            maxToRenderPerBatch={14}
-            windowSize={5}
-            removeClippedSubviews
-            renderItem={({ item: d }) => {
+            docFiltradosParaExibir.map((d) => {
               const sel = mesmoDocumentoSelecionado(docConsulta, d);
               return (
                 <Pressable
+                  key={`rapido-${String(d.id)}-${String(d.numero)}-${String(d.revisao)}`}
                   style={[styles.docLinha, sel && styles.docLinhaSelected]}
                   accessibilityRole="button"
                   accessibilityState={{ selected: sel }}
@@ -982,53 +805,9 @@ export default function ConsultaScreen() {
                   </Text>
                 </Pressable>
               );
-            }}
-          />
+            })
+          )}
         </View>
-      ) : null}
-      <Pressable
-        style={[styles.btnSec, (!payload || loading || buscandoDocs) && styles.btnOff]}
-        onPress={() => void buscarDocumentoConsulta()}
-        disabled={!payload || loading || buscandoDocs}
-      >
-        <Text style={styles.btnTextSec}>Buscar documento</Text>
-      </Pressable>
-      {msgDoc ? <Text style={styles.warn}>{msgDoc}</Text> : null}
-      {candidatosConsultaDoc && candidatosConsultaDoc.length > 0 ? (
-        <View style={{ marginBottom: 12, maxHeight: 320 }}>
-          <FlatList
-            nestedScrollEnabled
-            scrollEnabled={false}
-            keyboardShouldPersistTaps="handled"
-            data={candidatosConsultaDoc}
-            keyExtractor={(d) => `cand-${String(d.id)}-${String(d.numero)}`}
-            initialNumToRender={12}
-            maxToRenderPerBatch={14}
-            windowSize={5}
-            removeClippedSubviews
-            renderItem={({ item: d }) => {
-              const sel = mesmoDocumentoSelecionado(docConsulta, d);
-              return (
-                <Pressable
-                  style={[styles.docLinha, sel && styles.docLinhaSelected]}
-                  accessibilityRole="button"
-                  accessibilityState={{ selected: sel }}
-                    onPress={() => {
-                      setBuscaDoc(String(d.numero ?? ''));
-                      void hidratarDocumento(d);
-                    }}
-                  >
-                    <Text style={[styles.docLinhaTit, sel && styles.docLinhaTitSelected]}>
-                      {d.numero ?? '—'} — rev. {d.revisao ?? '—'}
-                    </Text>
-                    <Text style={[styles.docLinhaSub, sel && styles.docLinhaSubSelected]} numberOfLines={2}>
-                      {d.descricao ?? ''}
-                    </Text>
-                  </Pressable>
-                );
-              }}
-            />
-          </View>
       ) : null}
 
       {docConsulta ? (
@@ -1043,6 +822,7 @@ export default function ConsultaScreen() {
             const qAt = quantidadeAtendidaLinha(it as DocumentoItemPlanejamento);
             const rest = Math.max(0, qProj - qAt);
             const semSaldo = rest <= 0;
+            const unidade = String(it.unidade ?? '').trim();
             return (
               <View key={i} style={[styles.row, semSaldo && styles.rowSemSaldo]}>
                 <View style={styles.rowTxt}>
@@ -1050,10 +830,24 @@ export default function ConsultaScreen() {
                   <Text style={[styles.desc, semSaldo && styles.descSemSaldo]} numberOfLines={3}>
                     {it.descricao}
                   </Text>
-                  <Text style={[styles.meta2, semSaldo && styles.metaSemSaldo]}>
-                    Projeto: {formatQuantidadeExibicao(qProj)} {it.unidade ?? ''} · Já atendido:{' '}
-                    {formatQuantidadeExibicao(qAt)} · Restante: {formatQuantidadeExibicao(rest)}
-                  </Text>
+                  <StatPillRow
+                    dense
+                    columns={2}
+                    style={styles.itemPills}
+                    items={[
+                      { label: 'Projeto', value: formatQuantidadeComUnidade(qProj, unidade) },
+                      {
+                        label: 'Atendido',
+                        value: formatQuantidadeComUnidade(qAt, unidade),
+                        tone: semSaldo ? 'muted' : 'default',
+                      },
+                      {
+                        label: 'Pend. de atend.',
+                        value: formatQuantidadeComUnidade(rest, unidade),
+                        tone: semSaldo ? 'muted' : 'success',
+                      },
+                    ]}
+                  />
                   {semSaldo ? <Text style={styles.badgeSemSaldo}>Sem saldo — não atender mais</Text> : null}
                 </View>
               </View>
@@ -1065,89 +859,48 @@ export default function ConsultaScreen() {
       ) : null}
 
       {somenteRecebimento ? (
-      <View
-        onLayout={(e) => {
-          ySectionRecebimento.current = e.nativeEvent.layout.y;
-        }}
-      >
-      <Text style={styles.subTit}>Recebimento — materiais recebidos (NF / romaneio)</Text>
-      {mostrarTextosAjudaModulos ? (
-        <Text style={styles.hintSmall}>
-          Pesquisa paginada na nuvem (NF, romaneio, fornecedor). Não baixa a lista completa — adequado a grandes volumes.
-          {buscandoRecs ? ' A actualizar…' : ''}
-        </Text>
+      <View>
+      {msgRec ? <Text style={styles.warn}>{msgRec}</Text> : null}
+      {buscaRecNf.trim().length === 0 && !recConsulta ? (
+        <Text style={styles.emptyHint}>Digite NF, romaneio ou fornecedor para pesquisar.</Text>
       ) : null}
-      <TextInput
-        style={styles.input}
-        placeholder="Ex.: NF, romaneio, fornecedor ou código do item"
-        placeholderTextColor={colors.placeholder}
-        value={buscaRecNf}
-        onChangeText={(t) => {
-          setBuscaRecNf(t);
-          setRecConsulta(null);
-          setCandidatosRecConsulta(null);
-          setMsgRec(null);
-        }}
-        autoCapitalize="none"
-        autoCorrect={false}
-      />
-      {payload && (recsEscalaOk ? recsCloud.length > 0 || buscaRecNf.trim().length > 0 : (payload.recebimentos?.length ?? 0) > 0) &&
-      (buscaRecNf.trim().length > 0 || recsEscalaOk) ? (
-        <View style={{ marginBottom: 12 }}>
-          <Text style={[styles.hintSmall, { fontWeight: '700', marginBottom: 8 }]}>{tituloListaRecebimentos}</Text>
-          {listaBuscaUnificadaRecebimentos.length === 0 ? (
+      {buscaRecNf.trim().length > 0 || recConsulta ? (
+        <View style={styles.listaBox}>
+          <Text style={styles.listaTitulo}>{tituloListaRecebimentos}</Text>
+          {recFiltradosParaExibir.length === 0 ? (
             <Text style={styles.warn}>
               Nenhum recebimento combina com «{buscaRecNf.trim()}». Tente outro trecho da NF, fornecedor ou código.
             </Text>
           ) : (
-            <FlatList
-              style={{ maxHeight: 280 }}
-              nestedScrollEnabled
-              scrollEnabled={false}
-              keyboardShouldPersistTaps="handled"
-              data={listaBuscaUnificadaRecebimentos}
-              keyExtractor={(r) => `rec-busca-${String(r.id)}`}
-              initialNumToRender={14}
-              maxToRenderPerBatch={16}
-              windowSize={5}
-              removeClippedSubviews
-              renderItem={({ item: r }) => {
-                const sel = mesmoRecebimentoSelecionado(recConsulta, r);
-                return (
-                  <Pressable
-                    style={[styles.docLinha, sel && styles.docLinhaSelected]}
-                    accessibilityRole="button"
-                    accessibilityState={{ selected: sel }}
-                    onPress={() => {
-                      setBuscaRecNf(String(r.nota ?? r.romaneio ?? ''));
-                      void hidratarRecebimento(r);
-                    }}
-                  >
-                    <Text style={[styles.docLinhaTit, sel && styles.docLinhaTitSelected]}>
-                      {rotuloNotaRomaneioRecebimento(r)}
-                    </Text>
-                    <Text style={[styles.docLinhaSub, sel && styles.docLinhaSubSelected]} numberOfLines={2}>
-                      {r.fornecedorNome ?? ''}
-                    </Text>
-                    <Text style={[styles.meta, { marginTop: 4 }, sel && { color: colors.accent, fontWeight: '700' }]}>
-                      {linhaEstadoConferenciaMobile(r)}
-                      {String(r.data ?? '').trim() ? ` · ${String(r.data ?? '').slice(0, 10)}` : ''}
-                    </Text>
-                  </Pressable>
-                );
-              }}
-            />
+            recFiltradosParaExibir.map((r) => {
+              const sel = mesmoRecebimentoSelecionado(recConsulta, r);
+              return (
+                <Pressable
+                  key={`rec-busca-${String(r.id)}`}
+                  style={[styles.docLinha, sel && styles.docLinhaSelected]}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: sel }}
+                  onPress={() => {
+                    setBuscaRecNf(String(r.nota ?? r.romaneio ?? ''));
+                    void hidratarRecebimento(r);
+                  }}
+                >
+                  <Text style={[styles.docLinhaTit, sel && styles.docLinhaTitSelected]}>
+                    {rotuloNotaRomaneioRecebimento(r)}
+                  </Text>
+                  <Text style={[styles.docLinhaSub, sel && styles.docLinhaSubSelected]} numberOfLines={2}>
+                    {r.fornecedorNome ?? ''}
+                  </Text>
+                  <Text style={[styles.meta, { marginTop: 4 }, sel && { color: colors.accent, fontWeight: '700' }]}>
+                    {linhaEstadoConferenciaMobile(r)}
+                    {String(r.data ?? '').trim() ? ` · ${String(r.data ?? '').slice(0, 10)}` : ''}
+                  </Text>
+                </Pressable>
+              );
+            })
           )}
         </View>
       ) : null}
-      <Pressable
-        style={[styles.btnSec, (!payload || loading || buscandoRecs) && styles.btnOff]}
-        onPress={() => void buscarRecebimentoConsulta()}
-        disabled={!payload || loading || buscandoRecs}
-      >
-        <Text style={styles.btnTextSec}>Buscar recebimento</Text>
-      </Pressable>
-      {msgRec ? <Text style={styles.warn}>{msgRec}</Text> : null}
 
       {recConsulta ? (
         <View style={styles.card}>
@@ -1176,14 +929,17 @@ export default function ConsultaScreen() {
                 <Text style={styles.desc} numberOfLines={3}>
                   {String(it.descricao ?? '')}
                 </Text>
-                <Text style={styles.meta2}>
-                  Qtd NF: {String(it.quantidade ?? '—')} {it.unidade ? ` ${it.unidade}` : ''}
-                  {it.quantidadeConferida !== undefined && it.quantidadeConferida !== null && String(it.quantidadeConferida).trim() !== ''
-                    ? ` · Qtd conf.: ${String(it.quantidadeConferida)}`
+                <Text style={styles.itemQtd}>
+                  Qtd NF: {String(it.quantidade ?? '—')}
+                  {it.unidade ? ` ${it.unidade}` : ''}
+                  {it.quantidadeConferida !== undefined &&
+                  it.quantidadeConferida !== null &&
+                  String(it.quantidadeConferida).trim() !== ''
+                    ? `  ·  Qtd conf.: ${String(it.quantidadeConferida)}`
                     : ''}
                 </Text>
                 {String((it as RecebimentoItem).localizacao ?? '').trim() ? (
-                  <Text style={[styles.meta2, { marginTop: 4 }]} numberOfLines={2}>
+                  <Text style={styles.itemLocal} numberOfLines={2}>
                     Local: {String((it as RecebimentoItem).localizacao).trim()}
                   </Text>
                 ) : null}
@@ -1201,40 +957,8 @@ export default function ConsultaScreen() {
       </View>
       ) : null}
 
-      {somenteDocumentos ? (
-      <>
-      <Text style={styles.subTit}>Por código ou código de barras</Text>
-      {mostrarTextosAjudaModulos ? (
-        <Text style={styles.hintSmall}>
-          A partir de 3 caracteres, a consulta atualiza sozinha após uma pausa. Filtra os desenhos onde o material entra; em vermelho o que já foi
-          totalmente atendido neste desenho.
-        </Text>
-      ) : null}
-      <TextInput
-        style={styles.input}
-        placeholder="Código do material ou leitura do código de barras"
-        placeholderTextColor={colors.placeholder}
-        value={codigoConsulta}
-        onChangeText={setCodigoConsulta}
-        autoCapitalize="none"
-        autoCorrect={false}
-      />
-      <View style={styles.rowBarras}>
-        <Pressable
-          style={[styles.btnSec, styles.btnBarras, (!payload || loading) && styles.btnOff]}
-          onPress={abrirScanner}
-          disabled={!payload || loading}
-        >
-          <Text style={styles.btnTextSec}>Escanear</Text>
-        </Pressable>
-        <Pressable
-          style={[styles.btnOk, styles.btnBarrasGo, (!payload || loading) && styles.btnOff]}
-          onPress={consultarPorCodigo}
-          disabled={!payload || loading}
-        >
-          <Text style={styles.btnText}>Consultar</Text>
-        </Pressable>
-      </View>
+      {somenteMaterial ? (
+      <View>
       {materialResolvido ? (
         <Text style={styles.meta}>
           Material: {String(materialResolvido.codigo ?? '—')}
@@ -1260,8 +984,7 @@ export default function ConsultaScreen() {
                   {d.descricao ?? ''}
                 </Text>
                 <Text style={[styles.docLinhaMeta, semSaldo && styles.metaSemSaldo]}>
-                  Restante neste desenho (soma das linhas do código):{' '}
-                  {formatQuantidadeExibicao(restanteMaterial)}
+                  Restante neste desenho: {formatQuantidadeExibicao(restanteMaterial)}
                 </Text>
                 {semSaldo ? <Text style={styles.badgeSemSaldo}>Sem saldo neste desenho</Text> : null}
               </View>
@@ -1269,8 +992,9 @@ export default function ConsultaScreen() {
           })}
         </View>
       ) : null}
-      </>
+      </View>
       ) : null}
+      </ScrollView>
 
       <Modal visible={scannerOpen} animationType="slide" onRequestClose={() => setScannerOpen(false)}>
         <View style={styles.scannerWrap}>
@@ -1305,7 +1029,6 @@ export default function ConsultaScreen() {
           </Pressable>
         </View>
       </Modal>
-    </ScrollView>
+    </View>
   );
 }
-
