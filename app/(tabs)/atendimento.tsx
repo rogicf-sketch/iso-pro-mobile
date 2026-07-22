@@ -593,7 +593,7 @@ export default function AtendimentoScreen() {
                 : `${SNAPSHOT_CONFLICT_MESSAGE}\n\n${result.error}`;
             appAlert(
               'Conflito — recarregue a lista',
-              `${msg}\n\nOs registos permanecem nesta sessão neste telemóvel. Toque em «Carregar dados da nuvem», aguarde a faixa estabilizar e tente finalizar de novo.`,
+              `${msg}\n\nOs registos permanecem nesta sessão neste telemóvel. Toque em «Actualizar», aguarde a faixa estabilizar e tente finalizar de novo.`,
             );
             void carregarNuvem({ preservarEstado: true });
           } else {
@@ -1028,7 +1028,7 @@ export default function AtendimentoScreen() {
         if (!nuvemAt) {
           appAlert(
             'Atendimento',
-            'É preciso ter o snapshot da nuvem carregado (data do snapshot em cima). Toque em «Carregar dados da nuvem».',
+            'É preciso ter o snapshot da nuvem carregado (data do snapshot em cima). Toque em «Actualizar».',
           );
           return;
         }
@@ -1078,7 +1078,7 @@ export default function AtendimentoScreen() {
           if (!validacao.ok) {
             appAlert(
               'Dados não conferem',
-              `${validacao.motivo}\n\nSessão neste telemóvel: ${validacao.itensSessao} item(ns).\nNa nuvem: ${validacao.itensNuvem} item(ns).\n\nToque em «Carregar dados da nuvem» e aguarde a sincronização antes de finalizar.`,
+              `${validacao.motivo}\n\nSessão neste telemóvel: ${validacao.itensSessao} item(ns).\nNa nuvem: ${validacao.itensNuvem} item(ns).\n\nToque em «Actualizar» e aguarde a sincronização antes de finalizar.`,
             );
             return;
           }
@@ -1708,7 +1708,7 @@ export default function AtendimentoScreen() {
         <Text style={styles.err}>{recebedorResolvido.motivo}</Text>
       ) : null}
       {!nuvemAt && payload ? (
-        <Text style={styles.warn}>Toque em «Carregar dados da nuvem» e aguarde a data do snapshot em cima antes de registar.</Text>
+        <Text style={styles.warn}>Toque em «Actualizar» e aguarde a data do snapshot em cima antes de registar.</Text>
       ) : null}
       {snapshotCarregado && Boolean(nuvemAt) && !docReferenciaOk ? (
         <Text style={styles.warn}>
@@ -1771,7 +1771,7 @@ export default function AtendimentoScreen() {
       pendenciaMaterialCache?.codigo === (codigoAlvoPlanejamento?.trim() ?? '') ? (
         <Text style={[styles.warn, { fontSize: 12 }]}>
           Código sem registo em materiais, recebimentos nem desenhos neste aparelho. Confira a etiqueta ou envie o
-          planejamento do PC e toque em «Carregar dados da nuvem».
+          planejamento do PC e toque em «Actualizar».
         </Text>
       ) : null}
       <View style={styles.rowBarras}>
@@ -1835,7 +1835,7 @@ export default function AtendimentoScreen() {
                 ? `A enviar ${resumoSyncSessao.itensSessao} item(ns) para a nuvem… aguarde antes de finalizar.`
                 : resumoSyncSessao.emDia
                   ? `Sessão pronta (${resumoSyncSessao.itensSessao} item(ns)). Toque em Finalizar para fazer a confirmação autoritativa na nuvem.`
-                : `Sincronização: ${resumoSyncSessao.itensSessao} nesta sessão · ${resumoSyncSessao.itensNuvem} na nuvem (${resumoSyncSessao.faltam} pendente(s)). Aguarde ou toque em «Carregar dados da nuvem».`}
+                : `Sincronização: ${resumoSyncSessao.itensSessao} nesta sessão · ${resumoSyncSessao.itensNuvem} na nuvem (${resumoSyncSessao.faltam} pendente(s)). Aguarde ou toque em «Actualizar».`}
             </Text>
           ) : null}
           {mostrarTextosAjudaModulos ? (
