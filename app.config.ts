@@ -10,7 +10,7 @@ const config: ExpoConfig = {
   /** Organizacao Expo (EAS); obrigatorio para builds na nuvem com conta de equipa. */
   owner: 'isopros-organization',
   /** Subir quando gerar APK/AAB novo (confirma no telemóvel que não é build antigo). */
-  version: '1.0.72',
+  version: '1.0.79',
   orientation: 'portrait',
   scheme: 'isopromobile',
   userInterfaceStyle: 'automatic',
@@ -30,7 +30,7 @@ const config: ExpoConfig = {
     package: 'com.isopro.campo',
     /** Evita que o Android restaure dados (ex.: sessão no SecureStore) após reinstalar — exigia login e parecia «entrar direto». */
     allowBackup: false,
-    versionCode: 73,
+    versionCode: 80,
     adaptiveIcon: {
       foregroundImage: './assets/app-icon.png',
       backgroundColor: brandBackground,
@@ -41,6 +41,8 @@ const config: ExpoConfig = {
     supportsTablet: true,
     infoPlist: {
       LSApplicationQueriesSchemes: ['whatsapp', 'whatsapp-business'],
+      NSFaceIDUsageDescription:
+        'O I.S.O PRO Campo usa Face ID para desbloquear a sessão neste telemóvel quando a opção está activa.',
     },
   },
   plugins: [
@@ -58,6 +60,13 @@ const config: ExpoConfig = {
       {
         cameraPermission: 'O I.S.O PRO Campo precisa da camara para ler codigos de barras no atendimento.',
         microphonePermission: false,
+      },
+    ],
+    [
+      'expo-local-authentication',
+      {
+        faceIDPermission:
+          'O I.S.O PRO Campo usa Face ID para desbloquear a sessão neste telemóvel quando a opção está activa.',
       },
     ],
   ],

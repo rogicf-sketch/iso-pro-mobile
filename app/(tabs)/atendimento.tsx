@@ -67,7 +67,8 @@ import {
   resolverBuscaDocumentoPorNumero,
 } from '@/src/lib/documentoBusca';
 import { carregarDocumentosParaBuscaTexto } from '@/src/lib/documentoBuscaCloud';
-import { listDocumentosPendentesAtendimentoFromCloud } from '@/src/lib/escalaCloud';
+import { listDocumentosPendentesAtendimentoFromCloud, listDocumentosPlanejamentoPageFromCloud } from '@/src/lib/escalaCloud';
+import type { DocumentoPendenteAtendimento } from '@/src/lib/escalaCloud';
 import { formatOperadorNetworkError } from '@/src/lib/formatOperadorNetworkError';
 import { mergeDocumentosPlanejamentoNoPayload } from '@/src/lib/prefetchDocumentosAtendimento';
 import { formatQuantidadeComUnidade, formatQuantidadeExibicao } from '@/src/lib/formatQuantidade';
@@ -110,6 +111,22 @@ function mesmoDocumentoReferencia(a: DocumentoPlanejamento | null, b: DocumentoP
 }
 
 const MAX_DESENHOS_EM_MEMORIA = 48;
+const PAGE_SIZE_BUSCA_DESENHO = 50;
+
+function wireDocumentoBuscaAtendimento(
+  d: DocumentoPendenteAtendimento | Record<string, unknown>,
+): DocumentoPlanejamento {
+  const itensRaw = (d as { itens?: unknown[] }).itens;
+  return {
+    id: String((d as { id?: string | number }).id ?? ''),
+    numero: (d as { numero?: string }).numero,
+    revisao: (d as { revisao?: string }).revisao,
+    descricao: (d as { descricao?: string }).descricao,
+    responsavel: (d as { responsavel?: string }).responsavel,
+    status: (d as { status?: string }).status,
+    itens: (Array.isArray(itensRaw) ? itensRaw : []) as DocumentoItemPlanejamento[],
+  } as DocumentoPlanejamento;
+}
 
 /** Evita manter 1000+ resumos de prefetch antigo — só desenhos em uso na sessão. */
 function podarDocumentosEmMemoria(
@@ -146,6 +163,10 @@ export default function AtendimentoScreen() {
   const [msgBusca, setMsgBusca] = useState<string | null>(null);
   /** Busca de desenho na nuvem em curso — spinner no botão «Buscar documento». */
   const [buscandoDoc, setBuscandoDoc] = useState(false);
+  /** Resultados paginados da nuvem (igual Consulta) — não depende dos ~48 em memória. */
+  const [docsBuscaNuvem, setDocsBuscaNuvem] = useState<DocumentoPlanejamento[]>([]);
+  const [docsBuscaTotal, setDocsBuscaTotal] = useState(0);
+  const [docsBuscaQuery, setDocsBuscaQuery] = useState('');
   const [candidatosBuscaDoc, setCandidatosBuscaDoc] = useState<DocumentoPlanejamento[] | null>(null);
   const [doc, setDoc] = useState<DocumentoPlanejamento | null>(null);
   const [qtdLinha, setQtdLinha] = useState<Record<number, string>>({});
@@ -656,25 +677,33 @@ export default function AtendimentoScreen() {
   }, [payload?.documentos, doc?.id]);
 
   /**
-   * Com código identificado: só desenhos com **pendência** para dar baixa (igual critério da lista «Onde há pendência»).
-   * Sem código: resultados normais da pesquisa.
+   * Lista ao digitar: com código de material → só pendências desse código (local/RPC material).
+   * Sem código → resultados da nuvem (paginados, como Consulta) ou filtro local de fallback.
    */
   const docFiltradosRapido = useMemo(() => {
-    const list = payload?.documentos as DocumentoPlanejamento[] | undefined;
-    if (!list?.length) return [];
-    const t = buscaDoc.trim();
-    if (t.length < 1) return [];
-    let rows = filtrarDocumentosPlanejamentoPorTexto(list, buscaDoc, 50);
+    const q = buscaDoc.trim();
+    if (q.length < 1) return [];
+
     if (codigoAlvoPlanejamento) {
-      if (docsComPendenteMaterial.length > 0) {
-        const permitidos = new Set(docsComPendenteMaterial.map((x) => String(x.documento.id)));
-        rows = rows.filter((d) => permitidos.has(String(d.id)));
-      } else {
-        rows = [];
-      }
+      const base = docsComPendenteMaterial.map((x) => x.documento);
+      return filtrarDocumentosPlanejamentoPorTexto(base, buscaDoc, PAGE_SIZE_BUSCA_DESENHO);
     }
-    return rows;
-  }, [payload?.documentos, buscaDoc, codigoAlvoPlanejamento, docsComPendenteMaterial]);
+
+    if (docsBuscaQuery === q && docsBuscaNuvem.length > 0) {
+      return docsBuscaNuvem;
+    }
+
+    const list = payload?.documentos as DocumentoPlanejamento[] | undefined;
+    if (!list?.length) return docsBuscaQuery === q ? docsBuscaNuvem : [];
+    return filtrarDocumentosPlanejamentoPorTexto(list, buscaDoc, PAGE_SIZE_BUSCA_DESENHO);
+  }, [
+    payload?.documentos,
+    buscaDoc,
+    codigoAlvoPlanejamento,
+    docsComPendenteMaterial,
+    docsBuscaNuvem,
+    docsBuscaQuery,
+  ]);
 
   const docFiltradosParaExibir = useMemo(() => {
     if (!doc) return docFiltradosRapido;
@@ -760,10 +789,14 @@ export default function AtendimentoScreen() {
 
   /** Abre o desenho só quando a busca «inteligente» encontra uma correspondência única (evita mensagens a cada tecla). */
   const tentarAutoSelecionarDocumento = useCallback(() => {
-    if (!payload?.documentos?.length) return;
+    const pool =
+      docsBuscaQuery === buscaDoc.trim() && docsBuscaNuvem.length > 0
+        ? docsBuscaNuvem
+        : ((payload?.documentos ?? []) as DocumentoPlanejamento[]);
+    if (!pool.length) return;
     const raw = buscaDoc.trim();
     if (raw.length < 1) return;
-    const res = resolverBuscaDocumentoPorNumero(payload.documentos as DocumentoPlanejamento[], buscaDoc);
+    const res = resolverBuscaDocumentoPorNumero(pool, buscaDoc);
     if (res.kind === 'one') {
       if (!documentoPermitidoParaCodigoScaneado(res.doc)) return;
       abrirDocumentoAtendimento(res.doc);
@@ -774,7 +807,69 @@ export default function AtendimentoScreen() {
       if (!escolhido) return;
       abrirDocumentoAtendimento(escolhido);
     }
-  }, [buscaDoc, payload, documentoPermitidoParaCodigoScaneado, abrirDocumentoAtendimento]);
+  }, [
+    buscaDoc,
+    payload,
+    docsBuscaNuvem,
+    docsBuscaQuery,
+    documentoPermitidoParaCodigoScaneado,
+    abrirDocumentoAtendimento,
+  ]);
+
+  /**
+   * Pesquisa na nuvem como a Consulta: pendentes com p_busca (numero/descricao),
+   * fallback list_page. Não bloqueia o bipe — só corre ao digitar no campo do desenho.
+   */
+  const carregarBuscaDesenhosNuvem = useCallback(
+    async (busca: string) => {
+      const q = busca.trim();
+      if (q.length < 1) {
+        setDocsBuscaNuvem([]);
+        setDocsBuscaTotal(0);
+        setDocsBuscaQuery('');
+        return;
+      }
+      // Com material bipado a lista correta é a de pendência por código (já na UI).
+      if (codigoAlvoPlanejamento) return;
+
+      setBuscandoDoc(true);
+      try {
+        let wired: DocumentoPlanejamento[] = [];
+        let total = 0;
+
+        const pend = await listDocumentosPendentesAtendimentoFromCloud({
+          busca: q,
+          limit: PAGE_SIZE_BUSCA_DESENHO,
+        });
+        if (!pend.missing && !pend.error && pend.documentos.length > 0) {
+          wired = pend.documentos.map((d) => wireDocumentoBuscaAtendimento(d));
+          total = pend.total || wired.length;
+        } else {
+          const page = await listDocumentosPlanejamentoPageFromCloud({
+            busca: q,
+            offset: 0,
+            limit: PAGE_SIZE_BUSCA_DESENHO,
+          });
+          if (!page.missing && page.documentos.length > 0) {
+            wired = page.documentos.map((d) => wireDocumentoBuscaAtendimento(d as Record<string, unknown>));
+            total = page.total || wired.length;
+          }
+        }
+
+        if (wired.length > 0) {
+          mergeDocumentosNoPayload(wired);
+        }
+        setDocsBuscaNuvem(wired);
+        setDocsBuscaTotal(total);
+        setDocsBuscaQuery(q);
+      } catch {
+        /* mantém lista local se houver */
+      } finally {
+        setBuscandoDoc(false);
+      }
+    },
+    [codigoAlvoPlanejamento, mergeDocumentosNoPayload],
+  );
 
   const buscarDocumento = useCallback(() => {
     setMsgBusca(null);
@@ -787,90 +882,109 @@ export default function AtendimentoScreen() {
     }
     const alvo = norm(buscaDoc);
     if (!alvo) {
-      setMsgBusca('Informe o número do documento (ex.: AQ-3-BT-232-CS10-IQ).');
+      setMsgBusca('Informe o número ou trecho do desenho (ex.: SPDA ou E.RAZN010…).');
       return;
     }
     setBuscandoDoc(true);
     void (async () => {
-      let documentos: DocumentoPlanejamento[];
       try {
-        documentos = await carregarDocumentosParaBuscaTexto({
-          payload,
-          buscaTexto: buscaDoc,
-          mergeDocumentos: mergeDocumentosNoPayload,
-        });
+        let documentos: DocumentoPlanejamento[] = [];
+
+        if (codigoAlvoPlanejamento) {
+          documentos = docsComPendenteMaterial
+            .map((x) => x.documento)
+            .filter((d) => documentoPermitidoParaCodigoScaneado(d));
+          documentos = filtrarDocumentosPlanejamentoPorTexto(documentos, buscaDoc, PAGE_SIZE_BUSCA_DESENHO);
+        } else {
+          const pend = await listDocumentosPendentesAtendimentoFromCloud({
+            busca: buscaDoc.trim(),
+            limit: PAGE_SIZE_BUSCA_DESENHO,
+          });
+          if (!pend.missing && pend.documentos.length > 0) {
+            documentos = pend.documentos.map((d) => wireDocumentoBuscaAtendimento(d));
+          } else {
+            const page = await listDocumentosPlanejamentoPageFromCloud({
+              busca: buscaDoc.trim(),
+              offset: 0,
+              limit: PAGE_SIZE_BUSCA_DESENHO,
+            });
+            if (!page.missing && page.documentos.length > 0) {
+              documentos = page.documentos.map((d) =>
+                wireDocumentoBuscaAtendimento(d as Record<string, unknown>),
+              );
+            }
+          }
+          if (!documentos.length) {
+            documentos = await carregarDocumentosParaBuscaTexto({
+              payload,
+              buscaTexto: buscaDoc,
+              mergeDocumentos: mergeDocumentosNoPayload,
+            });
+            documentos = filtrarDocumentosPlanejamentoPorTexto(documentos, buscaDoc, PAGE_SIZE_BUSCA_DESENHO);
+          }
+          if (documentos.length > 0) {
+            mergeDocumentosNoPayload(documentos);
+            setDocsBuscaNuvem(documentos);
+            setDocsBuscaTotal(documentos.length);
+            setDocsBuscaQuery(buscaDoc.trim());
+          }
+        }
+
+        if (!documentos.length) {
+          setMsgBusca(`Nenhum desenho combina com «${buscaDoc.trim()}».`);
+          return;
+        }
+        if (documentos.length === 1) {
+          abrirDocumentoAtendimento(documentos[0]!);
+          return;
+        }
+        const porNumero = resolverBuscaDocumentoPorNumero(documentos, buscaDoc);
+        if (porNumero.kind === 'one') {
+          abrirDocumentoAtendimento(porNumero.doc);
+          return;
+        }
+        setCandidatosBuscaDoc(documentos);
+        setMsgBusca(
+          `${documentos.length} desenhos correspondem a «${buscaDoc.trim()}» — toque numa linha para abrir.`,
+        );
       } catch {
         setMsgBusca('Não foi possível ler o desenho na nuvem. Verifique a ligação.');
-        return;
+      } finally {
+        setBuscandoDoc(false);
       }
-      if (!documentos.length) {
-        setMsgBusca('Desenho não encontrado na nuvem. Confira o número ou envie o planejamento do PC.');
-        return;
-      }
-      const res = resolverBuscaDocumentoPorNumero(documentos, buscaDoc);
-      if (res.kind === 'none') {
-        const ex = exemplosNumerosDocumentos(documentos, 6);
-        setMsgBusca(
-          ex.length
-            ? `Nenhum desenho combina com «${buscaDoc.trim()}». Exemplos carregados: ${ex.join(' · ')}.`
-            : 'Nenhum documento encontrado.',
-        );
-        return;
-      }
-      if (res.kind === 'one') {
-        if (!documentoPermitidoParaCodigoScaneado(res.doc)) {
-          setMsgBusca(
-            codigoAlvoPlanejamento
-              ? `O desenho «${String(res.doc.numero ?? '—')}» já não tem retirada pendente para ${codigoAlvoPlanejamento}.`
-              : 'Documento encontrado.',
-          );
-          return;
-        }
-        abrirDocumentoAtendimento(res.doc);
-        return;
-      }
-      if (res.kind === 'sameNumeroVarios') {
-        const escolhido = res.docs.find((d) => documentoPermitidoParaCodigoScaneado(d));
-        if (!escolhido) {
-          setMsgBusca(
-            codigoAlvoPlanejamento
-              ? `Nenhuma revisão deste desenho tem retirada pendente para ${codigoAlvoPlanejamento}.`
-              : `${res.docs.length} documentos com o mesmo número.`,
-          );
-          return;
-        }
-        abrirDocumentoAtendimento(escolhido, {
-          mensagem: `${res.docs.length} documentos com o mesmo número — abrindo o que tem pendência.`,
-        });
-        return;
-      }
-      setCandidatosBuscaDoc(res.docs);
-      setMsgBusca(`${res.docs.length} desenhos correspondem a «${buscaDoc.trim()}» — toque numa linha para abrir.`);
-    })().finally(() => setBuscandoDoc(false));
+    })();
   }, [
     buscaDoc,
     payload,
     codigoAlvoPlanejamento,
+    docsComPendenteMaterial,
     documentoPermitidoParaCodigoScaneado,
     mergeDocumentosNoPayload,
     abrirDocumentoAtendimento,
   ]);
 
-  /** Após uma pausa curta, tenta abrir o único desenho que coincide com a busca inteligente. */
+  /** Após pausa: pesquisa na nuvem (Consulta-like) e tenta auto-abrir se houver match único por número. */
   useDebouncedEffect(
     () => {
-      if (!payload?.documentos?.length) return;
       const raw = buscaDoc.trim();
       if (raw.length < 1) {
-        /** Não limpar `doc` aqui: o documento pode ter sido aberto pelo código de material (único desenho). */
         setMsgBusca(null);
         setCandidatosBuscaDoc(null);
+        setDocsBuscaNuvem([]);
+        setDocsBuscaTotal(0);
+        setDocsBuscaQuery('');
         return;
       }
-      tentarAutoSelecionarDocumento();
+      if (codigoAlvoPlanejamento) {
+        tentarAutoSelecionarDocumento();
+        return;
+      }
+      void carregarBuscaDesenhosNuvem(raw).then(() => {
+        tentarAutoSelecionarDocumento();
+      });
     },
-    [buscaDoc, payload, tentarAutoSelecionarDocumento],
-    200,
+    [buscaDoc, codigoAlvoPlanejamento, carregarBuscaDesenhosNuvem, tentarAutoSelecionarDocumento],
+    320,
   );
 
   const atualizarQtd = useCallback((idx: number, t: string) => {
@@ -1796,6 +1910,10 @@ export default function AtendimentoScreen() {
             setCandidatosBuscaDoc(null);
             setMsgBusca(null);
             setQtdLinha({});
+            if (t.trim() !== docsBuscaQuery) {
+              setDocsBuscaNuvem([]);
+              setDocsBuscaTotal(0);
+            }
           }}
           autoCapitalize="characters"
           onFocus={() => {
@@ -1806,19 +1924,26 @@ export default function AtendimentoScreen() {
             blurDocsTimer.current = setTimeout(() => setMostrarListaDocsMaterial(false), 240);
           }}
         />
-        {payload && (payload.documentos?.length ?? 0) > 0 && buscaDoc.trim().length > 0 ? (
+        {buscaDoc.trim().length > 0 ? (
           <View style={[styles.docsMaterialBox, { marginTop: 8 }]}>
             <Text style={styles.docsMaterialTit}>
               {doc
                 ? 'Desenho em referência — altere o texto acima para ver outros resultados'
-                : `Desenhos (${docFiltradosParaExibir.length}${docFiltradosParaExibir.length >= 50 ? '+' : ''}${
-                    codigoAlvoPlanejamento ? ' · com retirada a fazer p/ o código' : ''
-                  }) — toque`}
+                : buscandoDoc && docFiltradosParaExibir.length === 0
+                  ? 'A procurar na nuvem…'
+                  : `Desenhos (${docFiltradosParaExibir.length}${
+                      docsBuscaTotal > docFiltradosParaExibir.length ? ` de ${docsBuscaTotal}` : ''
+                    }${codigoAlvoPlanejamento ? ' · com retirada a fazer p/ o código' : ''}) — toque`}
             </Text>
             {docFiltradosParaExibir.length === 0 ? (
               <Text style={styles.docsMaterialEmpty}>
-                Nenhum desenho combina com «{buscaDoc.trim()}»
-                {codigoAlvoPlanejamento ? ' (entre os que ainda têm atendimento a fazer para este código)' : ''}. Tente outro trecho do número ou da descrição.
+                {buscandoDoc
+                  ? 'A procurar desenhos…'
+                  : `Nenhum desenho combina com «${buscaDoc.trim()}»${
+                      codigoAlvoPlanejamento
+                        ? ' (entre os que ainda têm atendimento a fazer para este código)'
+                        : ''
+                    }. Tente outro trecho do número ou da descrição.`}
               </Text>
             ) : (
               <FlatList
