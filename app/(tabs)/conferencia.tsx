@@ -3,10 +3,8 @@ import { useFocusEffect } from 'expo-router';
 import { useNavigation } from '@react-navigation/native';
 import { CloudSyncStrip } from '@/src/components/mobile/CloudSyncStrip';
 import { EmptyStatePanel } from '@/src/components/mobile/EmptyStatePanel';
-import { ModuleScreenHeader } from '@/src/components/mobile/ModuleScreenHeader';
 import { PrimaryActionButton } from '@/src/components/mobile/PrimaryActionButton';
 import { StatPillRow } from '@/src/components/mobile/StatPillRow';
-import { buildMobileShellStyles } from '@/src/theme/buildMobileShellStyles';
 import { buildConferenciaStyles } from '@/src/theme/buildConferenciaStyles';
 import { useMobileUiPreferences } from '@/src/theme/MobileUiPreferencesContext';
 import { useTheme } from '@/src/theme/ThemeContext';
@@ -58,7 +56,9 @@ import {
   analisarDivergenciasAposFinalizar,
   linhaComDivergenciaVisual,
   mensagemResumoDivergencias,
+  parseQuantidadeNf,
 } from '@/src/lib/conferenciaQuantidades';
+import { formatQuantidadeComUnidade } from '@/src/lib/formatQuantidade';
 import { conferenciaLocalDifereDoSnapshot } from '@/src/lib/conferenciaEstado';
 import {
   MAX_LOCALIZACAO_ITEM,
@@ -126,7 +126,6 @@ export default function ConferenciaScreen() {
   const { colors } = useTheme();
   const { mostrarTextosAjudaModulos } = useMobileUiPreferences();
   const styles = useMemo(() => buildConferenciaStyles(colors), [colors]);
-  const shell = useMemo(() => buildMobileShellStyles(colors), [colors]);
   const configured = useMemo(() => hasSupabaseConfig(), []);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -981,16 +980,42 @@ export default function ConferenciaScreen() {
 
   return (
     <>
-    <ScrollView style={styles.scroll} contentContainerStyle={[styles.container, shell.screenPad]} keyboardShouldPersistTaps="handled">
-      <ModuleScreenHeader
-        kicker="Recebimento"
-        title="Conferência de materiais"
-        helpText="Ao abrir, carrega a nuvem e mostra as NFs pendentes de conferência. Toque numa linha para começar, ou filtre pelo campo abaixo. Guarde na nuvem antes de finalizar."
-        showHelp={mostrarTextosAjudaModulos}
-      />
+    <View style={styles.screen}>
+      <View style={styles.stickyHeader}>
+        {mostrarTextosAjudaModulos ? (
+          <Text style={[styles.hint, { marginBottom: 8, fontSize: 12, lineHeight: 17 }]}>
+            Ao abrir, carrega a nuvem e mostra as NFs pendentes. Toque numa linha ou filtre pelo campo. Guarde na nuvem
+            antes de finalizar.
+          </Text>
+        ) : null}
 
-      <CloudSyncStrip configured={configured} error={loadErr} loading={loading && !payload} updatedAt={nuvemAt} />
+        <CloudSyncStrip configured={configured} error={loadErr} loading={loading && !payload} updatedAt={nuvemAt} />
 
+        <PrimaryActionButton
+          disabled={loading || saving}
+          label="Atualizar dados da nuvem"
+          loading={loading}
+          onPress={() => void carregarNuvem()}
+        />
+
+        <Text style={styles.stickySubTit}>Filtrar NF, romaneio, fornecedor ou código</Text>
+        <TextInput
+          style={styles.inputSticky}
+          placeholder="Ex.: NF, romaneio, fornecedor ou código do item"
+          placeholderTextColor={colors.placeholder}
+          value={nfBusca}
+          onChangeText={(t) => {
+            setNfBusca(t);
+            setRec(null);
+            setCandidatosRec(null);
+            setBuscaMsg(null);
+          }}
+          autoCapitalize="none"
+          autoCorrect={false}
+        />
+      </View>
+
+    <ScrollView style={styles.scroll} contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
       {payload ? (
         <StatPillRow
           items={[
@@ -1003,13 +1028,6 @@ export default function ConferenciaScreen() {
           ]}
         />
       ) : null}
-
-      <PrimaryActionButton
-        disabled={loading || saving}
-        label="Atualizar dados da nuvem"
-        loading={loading}
-        onPress={() => void carregarNuvem()}
-      />
 
       {payload && !recsEscalaOk && (payload.recebimentos?.length ?? 0) === 0 ? (
         <Text style={styles.warn}>
@@ -1070,27 +1088,6 @@ export default function ConferenciaScreen() {
           )}
         </View>
       ) : null}
-
-      <Text style={styles.label}>Filtrar NF, romaneio, fornecedor ou código</Text>
-      {mostrarTextosAjudaModulos ? (
-        <Text style={[styles.hint, { marginBottom: 8 }]}>
-          Opcional: filtre a lista enquanto digita. Com ≥2 caracteres, após uma pausa tenta abrir sozinho se houver um único resultado claro.
-        </Text>
-      ) : null}
-      <TextInput
-        style={styles.input}
-        placeholder="Ex.: NF, romaneio, fornecedor ou código do item"
-        placeholderTextColor={colors.placeholder}
-        value={nfBusca}
-        onChangeText={(t) => {
-          setNfBusca(t);
-          setRec(null);
-          setCandidatosRec(null);
-          setBuscaMsg(null);
-        }}
-        autoCapitalize="none"
-        autoCorrect={false}
-      />
 
       {payload &&
       (recsEscalaOk ? recsCloud.length > 0 || nfBusca.trim().length > 0 : (payload.recebimentos?.length ?? 0) > 0) &&
@@ -1173,42 +1170,61 @@ export default function ConferenciaScreen() {
             const localPrevisto = localPrevistoPorLinha[linhaKey] ?? '';
             const localAtual = localTextoPorLinha[linhaKey] ?? '';
             const localAlterado = Boolean(localPrevisto && normalizarTextoLocalizacaoItem(localAtual) !== localPrevisto);
+            const unidadeLinha = String(it.unidade ?? '').trim();
+            const qtdNf = parseQuantidadeNf(it.quantidade);
+            const qtdConfTxt = (qtdConfTextoPorLinha[linhaKey] ?? '').trim();
+            const qtdConfPill = qtdConfTxt
+              ? unidadeLinha
+                ? `${qtdConfTxt} ${unidadeLinha}`
+                : qtdConfTxt
+              : '—';
             return (
             <View key={i} style={[styles.itemRow, divLinha && styles.itemRowDivergencia]}>
-              <View style={{ flex: 1 }}>
-                <View style={styles.itemHeaderRow}>
-                  <View style={styles.itemMeta}>
-                    <Text style={[styles.codigo, divLinha && styles.codigoDivergencia]}>{it.codigo ?? '—'}</Text>
-                  </View>
-                  <Pressable
-                    accessibilityLabel="Observação deste item"
-                    hitSlop={10}
-                    style={styles.btnObsItem}
-                    onPress={() => {
-                      setObsModalIndex(i);
-                      setObsModalDraft(String((it as RecebimentoItem).observacaoItem ?? '').slice(0, MAX_OBSERVACAO_ITEM));
-                    }}
-                  >
-                    <Text style={styles.btnObsItemDots}>⋯</Text>
-                  </Pressable>
+              <View style={styles.itemHeaderRow}>
+                <View style={styles.itemMeta}>
+                  <Text style={[styles.codigo, divLinha && styles.codigoDivergencia]}>{it.codigo ?? '—'}</Text>
                 </View>
-                <Text style={styles.desc} numberOfLines={2}>
-                  {String(it.descricao ?? '')}
-                </Text>
-                <Text style={styles.qtdNf}>
-                  Qtd NF: {String(it.quantidade ?? '—')} {it.unidade ? ` ${it.unidade}` : ''}
-                </Text>
-                {obsLinha ? (
-                  <Text style={styles.obsItemPreview} numberOfLines={2}>
-                    Obs.: {obsLinha}
-                  </Text>
-                ) : null}
+                <Pressable
+                  accessibilityLabel="Observação deste item"
+                  hitSlop={10}
+                  style={styles.btnObsItem}
+                  onPress={() => {
+                    setObsModalIndex(i);
+                    setObsModalDraft(String((it as RecebimentoItem).observacaoItem ?? '').slice(0, MAX_OBSERVACAO_ITEM));
+                  }}
+                >
+                  <Text style={styles.btnObsItemDots}>⋯</Text>
+                </Pressable>
               </View>
-              <View style={styles.itemColDireita}>
+              <Text style={styles.desc} numberOfLines={2}>
+                {String(it.descricao ?? '')}
+              </Text>
+              <StatPillRow
+                dense
+                columns={2}
+                style={styles.itemPills}
+                items={[
+                  {
+                    label: 'Qtd NF',
+                    value: formatQuantidadeComUnidade(qtdNf, unidadeLinha),
+                  },
+                  {
+                    label: 'Qtd conf.',
+                    value: qtdConfPill,
+                    tone: divLinha ? 'warn' : qtdConfTxt ? 'success' : 'muted',
+                  },
+                ]}
+              />
+              {obsLinha ? (
+                <Text style={styles.obsItemPreview} numberOfLines={2}>
+                  Obs.: {obsLinha}
+                </Text>
+              ) : null}
+              <View style={styles.itemCampos}>
                 <Text style={styles.labelCampoLinha}>Qtd conf.</Text>
                 <TextInput
                   style={[styles.inputQtd, !podeEditarConferenciaRec && { opacity: 0.65 }]}
-                  placeholder="—"
+                  placeholder="Igual à NF"
                   placeholderTextColor={colors.placeholder}
                   keyboardType="decimal-pad"
                   editable={podeEditarConferenciaRec}
@@ -1221,7 +1237,7 @@ export default function ConferenciaScreen() {
                 />
                 <Text style={styles.labelCampoLinha}>Local</Text>
                 {localPrevisto ? (
-                  <Text style={styles.localPrevisto} numberOfLines={1}>
+                  <Text style={styles.localPrevisto} numberOfLines={4}>
                     Prev.: {localPrevisto}
                   </Text>
                 ) : null}
@@ -1231,10 +1247,13 @@ export default function ConferenciaScreen() {
                     localAlterado && styles.inputLocalAlterada,
                     !podeEditarConferenciaRec && { opacity: 0.65 },
                   ]}
-                  placeholder={localPrevisto ? 'Confirmar local' : 'Ex.: A-12'}
+                  placeholder={localPrevisto ? 'Confirmar local' : 'Ex.: CONTAINER BOB.-03 | PÁTIO…'}
                   placeholderTextColor={colors.placeholder}
                   editable={podeEditarConferenciaRec}
                   maxLength={MAX_LOCALIZACAO_ITEM}
+                  multiline
+                  numberOfLines={3}
+                  scrollEnabled
                   value={localAtual}
                   onChangeText={(t) => {
                     if (!podeEditarConferenciaRec) return;
@@ -1280,6 +1299,7 @@ export default function ConferenciaScreen() {
 
       {saving ? <ActivityIndicator style={{ marginTop: 16 }} color={colors.accent} /> : null}
     </ScrollView>
+    </View>
 
     <Modal
       visible={obsModalIndex !== null}
