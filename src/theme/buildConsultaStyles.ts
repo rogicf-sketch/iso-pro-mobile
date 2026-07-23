@@ -192,7 +192,8 @@ export function buildConsultaStyles(c: ThemeColors) {
       fontWeight: '700',
       color: c.accent,
       marginTop: 6,
-      lineHeight: 19,
+      lineHeight: 20,
+      flexShrink: 1,
     },
     metaSemSaldo: { color: c.metaSemSaldo, fontWeight: '700', fontSize: 12 },
     badgeSemSaldo: {

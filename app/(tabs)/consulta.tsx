@@ -939,7 +939,7 @@ export default function ConsultaScreen() {
                     : ''}
                 </Text>
                 {String((it as RecebimentoItem).localizacao ?? '').trim() ? (
-                  <Text style={styles.itemLocal} numberOfLines={2}>
+                  <Text style={styles.itemLocal} numberOfLines={4}>
                     Local: {String((it as RecebimentoItem).localizacao).trim()}
                   </Text>
                 ) : null}
