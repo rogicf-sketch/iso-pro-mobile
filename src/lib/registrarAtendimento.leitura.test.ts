@@ -186,6 +186,7 @@ describe('resolverMaterialParaBaixaPorCodigo', () => {
       documentos: [],
       recebimentos: [
         {
+          id: 'rec-hash-1d',
           modoRecebimento: 'direto',
           itens: [{ codigo, descricao: 'Cabo', unidade: 'M', quantidade: 50 }],
         },

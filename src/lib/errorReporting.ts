@@ -3,6 +3,7 @@ import Constants from 'expo-constants';
 
 /**
  * Erros e eventos operacionais para o Sentry (`EXPO_PUBLIC_SENTRY_DSN` / extra.sentryDsn).
+ * Sem DSN: só console. info/warning → captureMessage; error → captureException.
  */
 
 function sentryEnabled(): boolean {
@@ -32,10 +33,22 @@ export function captureException(error: unknown, context?: Record<string, unknow
 export function captureMessage(
   message: string,
   context?: Record<string, unknown>,
-  _level: 'info' | 'warning' | 'error' = 'warning',
+  level: 'info' | 'warning' | 'error' = 'warning',
 ): void {
-  void _level;
-  captureException(new Error(message), { ...context, operationalMessage: true });
+  if (sentryEnabled()) {
+    if (level === 'error') {
+      Sentry.captureException(new Error(message), { extra: { ...context, operationalMessage: true } });
+    } else {
+      Sentry.captureMessage(message, { level, extra: { ...context, operationalMessage: true } });
+    }
+  }
+
+  const tag = '[iso-pro-mobile]';
+  if (level === 'error') {
+    console.error(tag, message, context ?? {});
+  } else {
+    console.warn(tag, message, context ?? {});
+  }
 }
 
 export function captureOperationalEvent(
